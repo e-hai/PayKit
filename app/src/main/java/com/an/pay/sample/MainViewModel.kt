@@ -4,46 +4,44 @@ import android.app.Application
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.an.pay.CountDownTimer
-import com.an.pay.PayManager
-import com.an.pay.billing.Subscriber
+import com.an.pay.PaymentManager
+import com.an.pay.SubscriptionStatus
+import com.an.pay.billing.GoogleBillingConfig
+import com.an.pay.billing.GoogleBillingProvider
 import com.android.billingclient.api.ProductDetails
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
-import kotlin.time.Duration
 
-class MainViewModel(val app: Application) : AndroidViewModel(app) {
+class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 
     private val _isSubscriber = MutableSharedFlow<Boolean>()
     val isSubscriber = _isSubscriber.asSharedFlow()
 
 
     fun init() {
-        PayManager.getInstance().init(app) {
-            Log.d("App", "初始化完成")
-            actionCheckSubscriber()
-            actionLoadSubProductList()
-        }
+        val config = GoogleBillingConfig(
+            subsProducts = listOf(Constants.SUBS_PRODUCT_MONTH, Constants.SUBS_PRODUCT_YEAR),
+            otpConsumerProducts = listOf(Constants.OTP_GAME_SKIN_3DAY),
+            otpNonConsumerProducts = listOf(Constants.OTP_GAME_SKIN_PERMANENT)
+        )
+        val paymentProvider = GoogleBillingProvider(app.applicationContext, config)
+        PaymentManager.getInstance().setPaymentProvider(paymentProvider)
     }
 
     /**判断是否为订阅用户**/
     fun actionCheckSubscriber() {
-        Log.d(TAG, "订阅用户=${PayManager.getInstance().isSubs()}")
+        PaymentManager.getInstance().checkSubscriptionStatus {
+            viewModelScope.launch {
+                when (it) {
+                    SubscriptionStatus.SUBSCRIBED -> _isSubscriber.emit(true)
+                    else -> _isSubscriber.emit(false)
+                }
+            }
+        }
     }
 
     /**查询可订阅的商品列表**/
     fun actionLoadSubProductList() {
-        PayManager.getInstance().queryProducts(object : PayManager.ProductListener {
-            override fun onSuccess(data: List<ProductDetails>) {
-                    Log.d(TAG, "查询商品=$data")
-            }
-
-            override fun onFail() {
-                Log.d(TAG, "查询商品失败")
-            }
-        })
     }
 
 

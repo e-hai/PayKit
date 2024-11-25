@@ -1,14 +1,12 @@
 package com.an.pay.sample
 
 import android.app.Application
-import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.an.pay.PaymentManager
-import com.an.pay.SubscriptionStatus
+import com.an.pay.base.SubscriptionStatus
 import com.an.pay.billing.GoogleBillingConfig
 import com.an.pay.billing.GoogleBillingProvider
-import com.android.billingclient.api.ProductDetails
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 

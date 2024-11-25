@@ -1,7 +1,7 @@
 package com.an.pay.billing
 
-import com.an.pay.PaymentProductDetails
-import com.an.pay.PaymentProductType
+import com.an.pay.base.PaymentProductDetails
+import com.an.pay.base.PaymentProductType
 
 
 class GoogleProductDetails(

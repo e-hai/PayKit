@@ -12,6 +12,6 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "AnPay"
+rootProject.name = "PayKit"
 include ':app'
 include ':pay'

@@ -1,7 +1,8 @@
 package com.an.pay.billing
 
-import com.an.pay.PaymentPurchaseDetails
-import com.an.pay.PaymentPurchaseState
+import com.an.pay.base.PaymentPurchaseDetails
+import com.an.pay.base.PaymentPurchaseState
+
 
 data class GooglePurchaseDetails(
     private val orderId: String,

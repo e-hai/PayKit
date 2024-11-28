@@ -48,6 +48,7 @@ class PaymentManager private constructor() {
      * 初始化完成后回调会通知初始化是否成功，并根据结果处理逻辑。
      */
     private fun initializeProvider() {
+        isInitialized = false
         paymentProvider.initialize(object : InitializationCallback {
             override fun onSuccess() {
                 isInitialized = true

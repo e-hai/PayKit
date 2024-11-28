@@ -27,6 +27,7 @@ import com.android.billingclient.api.ProductDetails
 import com.android.billingclient.api.Purchase
 import com.android.billingclient.api.QueryProductDetailsParams
 import com.android.billingclient.api.QueryPurchasesParams
+import com.android.billingclient.api.UnfetchedProduct
 
 
 class GoogleBillingProvider(private val context: Context, private val config: GoogleBillingConfig) :
@@ -57,6 +58,7 @@ class GoogleBillingProvider(private val context: Context, private val config: Go
                     .enableOneTimeProducts()// 启用一次性商品的支持
                     .build()
             )
+            .enableAutoServiceReconnection() // 自动重新建立连接
             .build()
 
         startConnectionWithRetry()  // 开始连接Google Billing服务，并处理可能的连接重试
@@ -106,7 +108,7 @@ class GoogleBillingProvider(private val context: Context, private val config: Go
 
             override fun onBillingServiceDisconnected() {
                 Log.w(TAG, "Initialization Disconnected")
-                // 连接断开，不进行自动重试，自动重试增加复杂性，给每个请求返回连接断开的错误码，让调用者自主实现策略
+                //已开启 enableAutoServiceReconnection() 自动重新建立连接，因此该方法留空，无需再实现重连逻辑
             }
         })
     }
@@ -153,16 +155,16 @@ class GoogleBillingProvider(private val context: Context, private val config: Go
         }
 
         // 创建查询商品的请求参数
-        val productDetailsParams = QueryProductDetailsParams.newBuilder()
+        val queryProductDetailsParams = QueryProductDetailsParams.newBuilder()
             .setProductList(productList)
             .build()
 
         // 发起商品查询请求
-        billingClient.queryProductDetailsAsync(productDetailsParams) { billingResult, productDetailsList ->
+        billingClient.queryProductDetailsAsync(queryProductDetailsParams) { billingResult, queryProductDetailsResult ->
             val response = BillingResponse(billingResult.responseCode)
-            if (response.isOk && productDetailsList.isNotEmpty()) {
+            if (response.isOk) {
                 // 查询成功，返回商品详情
-                val paymentProductDetailsList = productDetailsList.map {
+                val paymentProductDetailsList = queryProductDetailsResult.productDetailsList.map {
                     logProductDetails(it)  // 打印商品详情到日志
                     val paymentProductType = if (it.productType == BillingClient.ProductType.SUBS) {
                         PaymentProductType.SUBS  // 如果是订阅商品，使用SUBS类型
@@ -176,6 +178,10 @@ class GoogleBillingProvider(private val context: Context, private val config: Go
                         paymentProductType
                     )
                 }
+
+                queryProductDetailsResult.unfetchedProductList.forEach {
+                    logUnfetchedProduct(it)
+                }
                 callback.onQuerySuccess(paymentProductDetailsList)  // 返回查询成功的结果
             } else {
                 Log.e(
@@ -185,6 +191,17 @@ class GoogleBillingProvider(private val context: Context, private val config: Go
                 callback.onQueryFailure(fromBillingResponseCode(billingResult.responseCode))  // 查询失败，返回失败状态
             }
         }
+    }
+
+
+    private fun logUnfetchedProduct(unfetchedProduct: UnfetchedProduct?){
+        unfetchedProduct?:return
+        Log.d(
+            TAG,
+            "未获取到的商品- ID:${unfetchedProduct.productId} " +
+                    "类型:${unfetchedProduct.productType}"+
+                    " 状态:${unfetchedProduct.statusCode}"
+        )
     }
 
     /**
@@ -265,11 +282,11 @@ class GoogleBillingProvider(private val context: Context, private val config: Go
         val productDetailsParams = QueryProductDetailsParams.newBuilder()
             .setProductList(productList)
             .build()
-        billingClient.queryProductDetailsAsync(productDetailsParams) { billingResult, productDetailsList ->
+        billingClient.queryProductDetailsAsync(productDetailsParams) { billingResult, queryProductDetailsResult ->
             val response = BillingResponse(billingResult.responseCode)
             when {
                 response.isOk -> {
-                    val productDetailsParamsList = productDetailsList.map { productDetails ->
+                    val productDetailsParamsList = queryProductDetailsResult.productDetailsList.map { productDetails ->
                         if (productDetails.productType == BillingClient.ProductType.SUBS) {
                             val offerToken = productDetails.subscriptionOfferDetails
                                 ?.find { it.offerId == offerId }
@@ -345,17 +362,20 @@ class GoogleBillingProvider(private val context: Context, private val config: Go
                 .build()
         ) { billingResult, purchases ->
             if (billingResult.responseCode == BillingClient.BillingResponseCode.OK) {
-                for (purchase in purchases) {
-                    handlePurchase(purchase) {
-                    }
-                }
+                // 查询时不自动处理订单，只返回购买详情供业务层判断
                 val paymentPurchaseDetailsList = purchases.filterNotNull().map {
                     val paymentPurchaseState = when (it.purchaseState) {
                         Purchase.PurchaseState.PURCHASED -> PaymentPurchaseState.PURCHASED
                         Purchase.PurchaseState.PENDING -> PaymentPurchaseState.PENDING
                         else -> PaymentPurchaseState.UNSPECIFIED_STATE
                     }
-                    GooglePurchaseDetails(it.orderId ?: "", paymentPurchaseState, it.products)
+                    GooglePurchaseDetails(
+                        orderId = it.orderId ?: "",
+                        purchaseState = paymentPurchaseState,
+                        products = it.products,
+                        purchaseToken = it.purchaseToken,
+                        isAcknowledged = it.isAcknowledged
+                    )
                 }
                 callback.onQuerySuccess(paymentPurchaseDetailsList)
             } else {
@@ -381,6 +401,64 @@ class GoogleBillingProvider(private val context: Context, private val config: Go
             acknowledgePurchase(purchase, callback)
         } else if (purchaseIsOtpConsumable(purchase)) {
             consumablePurchase(purchase, callback)
+        }
+    }
+
+    /**
+     * 手动确认订单（用于应用重启后恢复未确认的订单）
+     * 适用于订阅商品和一次性非消耗商品
+     *
+     * @param purchaseToken 购买令牌
+     * @param callback 确认结果回调
+     */
+    fun acknowledgePurchaseByToken(
+        purchaseToken: String,
+        callback: (success: Boolean) -> Unit
+    ) {
+        val params = AcknowledgePurchaseParams.newBuilder()
+            .setPurchaseToken(purchaseToken)
+            .build()
+        billingClient.acknowledgePurchase(params) { billingResult ->
+            val response = BillingResponse(billingResult.responseCode)
+            when {
+                response.isOk -> {
+                    Log.i(TAG, "acknowledgePurchase：成功验证该商品 - token: $purchaseToken")
+                    callback.invoke(true)
+                }
+                else -> {
+                    Log.e(TAG, "acknowledgePurchase 失败：${billingResult.debugMessage}")
+                    callback.invoke(false)
+                }
+            }
+        }
+    }
+
+    /**
+     * 手动消费订单（用于应用重启后恢复未消费的订单）
+     * 适用于一次性消耗商品
+     *
+     * @param purchaseToken 购买令牌
+     * @param callback 消费结果回调
+     */
+    fun consumePurchaseByToken(
+        purchaseToken: String,
+        callback: (success: Boolean) -> Unit
+    ) {
+        val consumeParams = ConsumeParams.newBuilder()
+            .setPurchaseToken(purchaseToken)
+            .build()
+        billingClient.consumeAsync(consumeParams) { billingResult, purchaseToken ->
+            val response = BillingResponse(billingResult.responseCode)
+            when {
+                response.isOk -> {
+                    Log.d(TAG, "consumeAsync: 成功消耗该商品 - token: $purchaseToken")
+                    callback.invoke(true)
+                }
+                else -> {
+                    Log.e(TAG, "consumeAsync 失败：${billingResult.debugMessage}")
+                    callback.invoke(false)
+                }
+            }
         }
     }
 

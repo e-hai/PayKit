@@ -15,13 +15,19 @@ class MainActivity : AppCompatActivity() {
         // 初始化支付 SDK（会在初始化回调中自动处理后续操作）
         mainViewModel.init()
         
-        // 检查订阅状态
-        mainViewModel.actionCheckSubscriber()
-        
         // 加载商品列表
         mainViewModel.actionLoadSubProductList()
         
         // 注意：无需手动调用 actionRecoverUnfinishedOrders()
         // 它会在 SDK 初始化成功后自动调用
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // 清理资源，防止内存泄露
+        // 如果 Activity 被销毁（如屏幕旋转、用户退出），调用 cleanup
+        if (isFinishing) {
+            mainViewModel.cleanup()
+        }
     }
 }

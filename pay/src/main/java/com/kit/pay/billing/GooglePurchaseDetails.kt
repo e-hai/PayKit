@@ -27,14 +27,14 @@ data class GooglePurchaseDetails(
     /**
      * 获取购买令牌，用于确认或消费订单
      */
-    fun getPurchaseToken(): String {
+    override fun getPurchaseToken(): String {
         return purchaseToken
     }
 
     /**
      * 检查订单是否已确认（针对订阅和一次性非消耗商品）
      */
-    fun isAcknowledged(): Boolean {
+    override fun isAcknowledged(): Boolean {
         return isAcknowledged
     }
 }

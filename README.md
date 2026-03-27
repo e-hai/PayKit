@@ -87,19 +87,6 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 }
 ```
 
-**简化用法**（无需回调）：
-
-```kotlin
-// 如果不需要感知初始化状态，可以省略 callback
-PaymentManager.getInstance().setPaymentProvider(paymentProvider)
-```
-
-**重要变化**：
-- ✅ **移除了任务队列**：不再需要理解复杂的延迟执行机制
-- ✅ **暴露初始化回调**：开发者可以精确控制 SDK 使用时机
-- ✅ **更清晰的错误处理**：初始化失败时立即通知
-- ✅ **更早发现问题**：初始化阶段就能发现配置错误
-
 ---
 
 ## 使用指南

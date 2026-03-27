@@ -15,5 +15,5 @@ interface QueryPurchasesCallback {
     /**
      * 当购买记录查询失败时调用。
      */
-    fun onQueryFailure(errorCode: PaymentErrorCode)
+    fun onQueryFailure(errorCode: PaymentCode)
 }

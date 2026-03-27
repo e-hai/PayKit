@@ -21,5 +21,5 @@ interface PaymentCallback {
      *                  - 支付提供者的服务错误
      *                  - 未知错误
      */
-    fun onFailure(errorCode: PaymentErrorCode)
+    fun onFailure(errorCode: PaymentCode)
 }

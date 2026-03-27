@@ -1,22 +1,11 @@
 package com.kit.pay.billing
 
 import android.app.Activity
-import android.content.Context
-import android.os.Handler
-import android.os.Looper
+import android.app.Application
 import android.util.Log
-import com.kit.pay.base.InitializationCallback
-import com.kit.pay.base.PaymentCallback
-import com.kit.pay.base.PaymentErrorCode
-import com.kit.pay.base.PaymentProductType
-import com.kit.pay.base.PaymentProvider
-import com.kit.pay.base.PaymentPurchaseState
-import com.kit.pay.base.QueryProductsCallback
-import com.kit.pay.base.QueryPurchasesCallback
-import com.kit.pay.base.SubscriptionStatusCallback
-import com.kit.pay.billing.BillingResponse.Companion.fromBillingResponseCode
 import com.android.billingclient.api.AcknowledgePurchaseParams
 import com.android.billingclient.api.BillingClient
+import com.android.billingclient.api.BillingClient.BillingResponseCode
 import com.android.billingclient.api.BillingClientStateListener
 import com.android.billingclient.api.BillingFlowParams
 import com.android.billingclient.api.BillingFlowParams.ProductDetailsParams
@@ -28,81 +17,74 @@ import com.android.billingclient.api.Purchase
 import com.android.billingclient.api.QueryProductDetailsParams
 import com.android.billingclient.api.QueryPurchasesParams
 import com.android.billingclient.api.UnfetchedProduct
+import com.kit.pay.base.InitializationCallback
+import com.kit.pay.base.PaymentCallback
+import com.kit.pay.base.PaymentCode
+import com.kit.pay.base.PaymentProductType
+import com.kit.pay.base.PaymentProvider
+import com.kit.pay.base.PaymentPurchaseState
+import com.kit.pay.base.PurchaseCallback
+import com.kit.pay.base.QueryProductsCallback
+import com.kit.pay.base.QueryPurchasesCallback
+import com.kit.pay.billing.BillingResponse.Companion.fromBillingResponseCode
+import com.kit.pay.utils.LogUtil
 
+/**
+ * 将 PaymentProductType 转换为 BillingClient.ProductType
+ */
+private fun PaymentProductType.toBillingProductType(): String {
+    return when (this) {
+        PaymentProductType.SUBS -> BillingClient.ProductType.SUBS
+        PaymentProductType.INAPP -> BillingClient.ProductType.INAPP
+    }
+}
 
-class GoogleBillingProvider(private val context: Context, private val config: GoogleBillingConfig) :
-    PaymentProvider {
-    private lateinit var billingClient: BillingClient  // Google Billing Client实例，用于与Google Play进行通信
-    private lateinit var initializationCallback: InitializationCallback  // 初始化回调，用于通知初始化结果
-    private var retryCount = 0  // 重试计数器，用于处理连接失败时的重试机制
-    private val maxRetryCount = 3  // 最大重试次数
-    private val retryDelay = 2000L // 重试的时间间隔（单位：毫秒）
-    private var paymentCallback: PaymentCallback? = null  // 支付回调，用于通知支付状态
+class GoogleBillingProvider(
+    private val app: Application
+) : PaymentProvider {
+    private lateinit var billingClient: BillingClient
+    private var purchaseListener: PurchaseCallback? = null
+
 
     /**
-     * 初始化支付提供者，建立与Google Play的连接。
+     * 初始化支付提供者，建立与 Google Play 的连接。
      * 连接成功后会调用`initializationCallback.onInitialized(true)`。
-     * 连接失败则会启动重试机制，最多重试3次。
+     * 连接失败则会启动重试机制，最多重试 3 次。
      *
      * @param callback 初始化回调函数。
      */
     override fun initialize(callback: InitializationCallback) {
-        initializationCallback = callback  // 将回调函数存储，以便后续通知
-        billingClient = BillingClient.newBuilder(context)  // 创建BillingClient实例
+        // 使用 Application Context 创建 BillingClient，避免泄露
+        billingClient = BillingClient.newBuilder(app)
             .setListener { billingResult, purchases ->
-                handlePurchasesUpdated(billingResult, purchases)  // 处理购买更新事件
+                handlePurchasesUpdated(billingResult, purchases)
             }
-            .enablePendingPurchases(
+            .enablePendingPurchases(    //启用对“待处理购买交易”的支持，即用户未完成支付的订单
                 PendingPurchasesParams.newBuilder()
-                    .enablePrepaidPlans()   // 启用挂起购买的支持
-                    .enableOneTimeProducts()// 启用一次性商品的支持
+                    .enableOneTimeProducts() // 必须：启用一次性商品支持
+                    .enablePrepaidPlans()    // 可选：启用预付费方案支持，如果应用内有预付费型订阅（非自动续订），可开启
                     .build()
             )
-            .enableAutoServiceReconnection() // 自动重新建立连接
+            .enableAutoServiceReconnection()  // 内部自动重连
             .build()
 
-        startConnectionWithRetry()  // 开始连接Google Billing服务，并处理可能的连接重试
+        startConnectionWithRetry(callback)
     }
 
-    /**
-     * 检查用户是否订阅了指定的产品。
-     *
-     * @param callback 回调函数，用于返回订阅状态。
-     */
-    override fun checkSubscriptionStatus(callback: SubscriptionStatusCallback) {
-        // 异步查询用户的购买记录
-        billingClient.queryPurchasesAsync(
-            QueryPurchasesParams.newBuilder()
-                .setProductType(BillingClient.ProductType.SUBS)  // 只查询订阅类型的产品
-                .build()
-        ) { billingResult, purchases ->
-            if (billingResult.responseCode == BillingClient.BillingResponseCode.OK) {
-                // 如果查询成功，遍历购买记录，检查是否存在已购买的订阅
-                var isSubscribed = false
-                purchases.forEach {
-                    if (it.purchaseState == Purchase.PurchaseState.PURCHASED) {
-                        isSubscribed = true  // 找到有效的订阅
-                    }
-                }
-                callback.onStatusReceived(isSubscribed)  // 回调返回订阅状态
-            } else {
-                callback.onStatusError(fromBillingResponseCode(billingResult.responseCode))  // 如果查询失败，返回错误状态
-            }
-        }
-    }
 
     /**
      * 启动与Google Billing的连接。如果连接失败，则根据重试机制进行重试。
      */
-    private fun startConnectionWithRetry() {
+    private fun startConnectionWithRetry(callback: InitializationCallback) {
         billingClient.startConnection(object : BillingClientStateListener {
             override fun onBillingSetupFinished(billingResult: BillingResult) {
-                if (billingResult.responseCode == BillingClient.BillingResponseCode.OK) {
-                    retryCount = 0  // 连接成功后重置重试计数器
-                    initializationCallback.onSuccess()  // 通知初始化成功
-                    Log.w(TAG, "Initialization Success")
+                if (billingResult.responseCode == BillingResponseCode.OK) {
+                    callback.onSuccess()  // 通知初始化成功
+                    Log.w(TAG, "google play billing 初始化成功")
                 } else {
-                    handleInitializationFailure()  // 如果连接失败，则进行重试
+                    LogUtil.e("google play billing 初始化失败")
+                    callback.onFailure(fromBillingResponseCode(billingResult.responseCode))
+                    cleanup()
                 }
             }
 
@@ -113,43 +95,51 @@ class GoogleBillingProvider(private val context: Context, private val config: Go
         })
     }
 
+    override fun setPurchaseListener(listener: PurchaseCallback) {
+        this.purchaseListener = listener
+    }
+
     /**
-     * 如果初始化连接失败，则会尝试进行重试。最多重试3次，每次重试的间隔为2秒。
+     * 1.在单次购买流程中，支付结果是二选一的，不会在同一个回调列表里既给你“成功的订单”又给你“取消的订单”。
+     * 如果用户取消了当前购买：
+     * BillingResult.getResponseCode() 会返回 USER_CANCELED。
+     * List<Purchase> 通常为 null 或者 空列表。
+     * 结论： 只要响应码不是 OK，你就不需要去遍历那个列表，直接提示用户“支付已取消”即可。
+     * 如果用户支付成功：
+     * BillingResult.getResponseCode() 返回 OK。
+     * List<Purchase> 包含本次刚支付成功的订单，以及之前支付成功但尚未确认（Acknowledge）/消耗（Consume）的遗留订单。
+     * 2. 为什么会有“多个交易”出现在列表里？
+     * 你可能会疑惑：既然用户一次只能买一个，为什么给的是 List<Purchase> 列表？
+     * 这主要是为了补单机制（Reliability）：
+     * 未完成的旧订单： 如果用户上次买完后还没来得及发货，App 就崩溃了或者网络断了，那么当他下一次尝试购买任何东西触发 onPurchasesUpdated 时，Google 会把那个“已支付但未处理”的旧订单连同新订单一起塞进这个 List 发给你
+     * 处理支付结果更新事件，确认支付状态，并根据支付状态调用相应的回调。
      *
-     * 在最大重试次数内，每次重试会延迟2秒。如果重试超过最大次数仍未成功，则回调初始化失败。
+     * @param billingResult 支付结果。
+     * @param purchases 购买的商品列表。
      */
-    private fun handleInitializationFailure() {
-        if (retryCount < maxRetryCount) {
-            retryCount++  // 增加重试计数
-            Log.w(TAG, "Initialization failed. Retrying... ($retryCount/$maxRetryCount)")
-            // 延迟2秒后重试
-            Handler(Looper.getMainLooper()).postDelayed(
-                { startConnectionWithRetry() }, retryDelay
-            )
-        } else {
-            initializationCallback.onFailure(PaymentErrorCode.SERVICE_DISCONNECTED)  // 如果超过最大重试次数，回调初始化失败
-        }
+    private fun handlePurchasesUpdated(billingResult: BillingResult, purchases: List<Purchase>?) {
+        LogUtil.d("有交易订单更新=${billingResult.responseCode} ${billingResult.debugMessage}")
+        purchaseListener?.onUpdate(
+            fromBillingResponseCode(billingResult.responseCode),
+            mapToPaymentPurchaseList(purchases ?: emptyList())
+        )
     }
 
     /**
      * 查询多个商品的详细信息。
      *
-     * @param productIds 商品ID列表。
+     * @param products 商品 ID 和类型列表。
      * @param callback 查询回调，返回查询结果。
      */
     override fun queryProducts(
-        productIds: List<String>,
+        products: List<Pair<String, PaymentProductType>>,
         callback: QueryProductsCallback
     ) {
-        // 构造查询参数列表，每个商品需要指定其类型（订阅或一次性购买）
-        val productList = productIds.map { product ->
-            val billingProductType = if (productIsSubs(product)) {
-                BillingClient.ProductType.SUBS  // 如果是订阅商品，则设置为SUBS类型
-            } else {
-                BillingClient.ProductType.INAPP  // 否则设置为INAPP类型
-            }
+        // 构造查询参数列表
+        val productList = products.map { (productId, productType) ->
+            val billingProductType = productType.toBillingProductType()
             QueryProductDetailsParams.Product.newBuilder()
-                .setProductId(product)
+                .setProductId(productId)
                 .setProductType(billingProductType)
                 .build()
         }
@@ -163,13 +153,13 @@ class GoogleBillingProvider(private val context: Context, private val config: Go
         billingClient.queryProductDetailsAsync(queryProductDetailsParams) { billingResult, queryProductDetailsResult ->
             val response = BillingResponse(billingResult.responseCode)
             if (response.isOk) {
-                // 查询成功，返回商品详情
+                // 1. 处理成功获取到的商品
                 val paymentProductDetailsList = queryProductDetailsResult.productDetailsList.map {
                     logProductDetails(it)  // 打印商品详情到日志
                     val paymentProductType = if (it.productType == BillingClient.ProductType.SUBS) {
-                        PaymentProductType.SUBS  // 如果是订阅商品，使用SUBS类型
+                        PaymentProductType.SUBS
                     } else {
-                        PaymentProductType.INAPP  // 否则使用INAPP类型
+                        PaymentProductType.INAPP
                     }
                     GoogleProductDetails(
                         it.productId,
@@ -179,27 +169,45 @@ class GoogleBillingProvider(private val context: Context, private val config: Go
                     )
                 }
 
-                queryProductDetailsResult.unfetchedProductList.forEach {
-                    logUnfetchedProduct(it)
+                // 2. 处理未获取到的商品 (UnfetchedProduct)
+                val unfetchedProductIds = queryProductDetailsResult.unfetchedProductList.map { unfetched ->
+                    logUnfetchedProduct(unfetched)
+                    unfetched.productId
                 }
-                callback.onQuerySuccess(paymentProductDetailsList)  // 返回查询成功的结果
+
+                // 返回查询结果，包括成功和失败的部分
+                callback.onQuerySuccess(paymentProductDetailsList, unfetchedProductIds)
             } else {
                 Log.e(
                     TAG,
-                    "onProductDetailsResponse: ${response.code} ${billingResult.debugMessage}"
+                    "onProductDetailsResponse Error: ${response.code} ${billingResult.debugMessage}"
                 )
-                callback.onQueryFailure(fromBillingResponseCode(billingResult.responseCode))  // 查询失败，返回失败状态
+                callback.onQueryFailure(fromBillingResponseCode(billingResult.responseCode))
             }
         }
     }
 
 
-    private fun logUnfetchedProduct(unfetchedProduct: UnfetchedProduct?){
-        unfetchedProduct?:return
+    /**
+     * 未能根据商品ID和类型，获取到商品的信息
+     * 根据官方文档 UnfetchedProduct.StatusCode 包含以下关键状态码：
+     *
+     * NO_ELIGIBLE_OFFER = 4‌：商品存在，但‌没有符合条件的购买选项或优惠‌。
+     *  例如：订阅没有可用的基础计划（base plan）；一次性商品没有配置任何有效的购买选项。
+     *
+     * PRODUCT_NOT_FOUND = 3‌：商品未找到。
+     *  可能原因：商品已被删除、从未创建、类型错误，或刚创建但尚未在 Google Play 后台完全传播。
+     *
+     * INVALID_PRODUCT_ID_FORMAT = 2‌：商品 ID 格式不合法（如订阅 ID 不符合 Google Play 的命名规范）‌
+     *
+     * UNKNOWN = 0‌：未知错误。
+     * **/
+    private fun logUnfetchedProduct(unfetchedProduct: UnfetchedProduct?) {
+        unfetchedProduct ?: return
         Log.d(
             TAG,
             "未获取到的商品- ID:${unfetchedProduct.productId} " +
-                    "类型:${unfetchedProduct.productType}"+
+                    "类型:${unfetchedProduct.productType}" +
                     " 状态:${unfetchedProduct.statusCode}"
         )
     }
@@ -257,22 +265,22 @@ class GoogleBillingProvider(private val context: Context, private val config: Go
      * 发起支付流程，包括一次性购买和订阅购买。
      *
      * @param activity 当前活动的Activity对象，用于发起支付。
+     * @param productType 产品类型。
      * @param productId 产品ID。
      * @param offerId 订阅优惠ID。
+     * @param orderId 订单ID。
      * @param callback 支付回调，用于返回支付结果。
      */
     override fun makePayment(
         activity: Activity,
+        productType: PaymentProductType,
         productId: String,
         offerId: String,
+        orderId: String,
         callback: PaymentCallback
     ) {
-        this.paymentCallback = callback
-        val billingProductType = if (productIsSubs(productId)) {
-            BillingClient.ProductType.SUBS
-        } else {
-            BillingClient.ProductType.INAPP
-        }
+        val billingProductType = productType.toBillingProductType()
+
         val productList = listOf(
             QueryProductDetailsParams.Product.newBuilder()
                 .setProductId(productId)
@@ -286,82 +294,77 @@ class GoogleBillingProvider(private val context: Context, private val config: Go
             val response = BillingResponse(billingResult.responseCode)
             when {
                 response.isOk -> {
-                    val productDetailsParamsList = queryProductDetailsResult.productDetailsList.map { productDetails ->
-                        if (productDetails.productType == BillingClient.ProductType.SUBS) {
-                            val offerToken = productDetails.subscriptionOfferDetails
-                                ?.find { it.offerId == offerId }
-                                ?.offerToken
-                                ?: ""
-                            ProductDetailsParams.newBuilder()
-                                .setProductDetails(productDetails)
-                                .setOfferToken(offerToken)
-                                .build()
-                        } else {
-                            ProductDetailsParams.newBuilder()
-                                .setProductDetails(productDetails)
-                                .build()
+                    val productDetailsParamsList =
+                        queryProductDetailsResult.productDetailsList.map { productDetails ->
+                            if (productDetails.productType == BillingClient.ProductType.SUBS) {
+                                val offerToken = productDetails.subscriptionOfferDetails
+                                    ?.find { it.offerId == offerId }
+                                    ?.offerToken
+                                    ?: ""
+                                ProductDetailsParams.newBuilder()
+                                    .setProductDetails(productDetails)
+                                    .setOfferToken(offerToken)
+                                    .build()
+                            } else {
+                                ProductDetailsParams.newBuilder()
+                                    .setProductDetails(productDetails)
+                                    .build()
+                            }
                         }
-                    }
 
+                    //1. 核心商品参数 (ProductDetailsParams)
+                    //  在结算库 5.0 及更高版本中，必须通过 setProductDetailsParamsList 方法设置。
+                    //  ProductDetails: 通过 queryProductDetailsAsync 查询到的商品详情对象。它包含了商品的价格、标题、描述等信息。
+                    //  OfferToken: 仅限订阅商品。订阅商品可能有多个基础方案（Base Plan）和优惠方案（Offer），offerToken 用于指定用户具体购买哪一个方案。
+                    //2. 订阅升级/降级参数 (SubscriptionUpdateParams)
+                    //  当用户想要更改现有订阅（例如从“月度会员”升级为“年度会员”）时，需要配置此参数：
+                    //  OldPurchaseToken: 当前正在使用的旧订阅的购买令牌（Purchase Token）。Google Play 会利用它定位用户要替换的旧方案。
+                    //  SubscriptionReplacementMode: 替换模式（旧版本称为 ProrationMode），定义如何处理剩余的订阅时长或金额。常见模式包括：
+                    //  CHARGE_FULL_PRICE：立即按新价格扣款，新订阅立即生效。
+                    //  WITH_TIME_PRORATION：按比例转换剩余时长。
+                    //  DEFERRED：等到当前周期结束后再切换到新订阅。
+                    //3. 用户标识参数 (Obfuscated Identifiers)
+                    //  用于将购买交易与应用内的特定账号关联，防止恶意代充或掉单：
+                    //  setObfuscatedAccountId: 混淆后的应用内用户账号 ID（建议使用 UUID 的哈希值）。
+                    //  setObfuscatedProfileId: 混淆后的用户个人资料 ID（如果应用支持多角色，可填此项）。
+                    //  注意：请勿在此处直接存放用户明文邮箱或 ID，需进行混淆处理。
+                    //4. 开发者选项参数 (Developer Options)
+                    //  场景意义：这主要用于配合 Google 的备选结算系统（Alternative Billing）或外部支付计划。
+                    //  在这些计划下，开发者可以向用户提供除 Google Play 以外的第三方支付方式。
+                    //  功能联动：通常需要与 DeveloperBillingOptionParams 等类配合使用，用以定义具体的支付详情
                     val billingFlowParams = BillingFlowParams.newBuilder()
+//                        .enableDeveloperBillingOption()
+                        .setObfuscatedAccountId(orderId) //使用用户账号ID的位置来透传订单ID
+//                        .setObfuscatedProfileId()
+//                        .setSubscriptionUpdateParams()
                         .setProductDetailsParamsList(productDetailsParamsList)
                         .setIsOfferPersonalized(true)  //欧盟政策
                         .build()
-                    val responseCode = billingClient.launchBillingFlow(
-                        (context as Activity),
-                        billingFlowParams
-                    ).responseCode
-                    Log.d(TAG, "launchBillingFlow: BillingResponse $responseCode")
-                    if (responseCode != BillingClient.BillingResponseCode.OK) {
-                        paymentCallback?.onFailure(fromBillingResponseCode(billingResult.responseCode))
-                    }
+                    val billingResult = billingClient.launchBillingFlow(activity, billingFlowParams)
+                    Log.d(TAG, "launchBillingFlow: 启动结果 $billingResult")
                 }
 
                 else -> {
-                    paymentCallback?.onFailure(fromBillingResponseCode(billingResult.responseCode))
+                    Log.e(TAG, "launchBillingFlow: 匹配不到商品 ${response.code}")
+                    callback.onFailure(fromBillingResponseCode(response.code))
                 }
             }
         }
     }
 
-    /**
-     * 处理支付结果更新事件，确认支付状态，并根据支付状态调用相应的回调。
-     *
-     * @param billingResult 支付结果。
-     * @param purchases 购买的商品列表。
-     */
-    private fun handlePurchasesUpdated(billingResult: BillingResult, purchases: List<Purchase>?) {
-        if (billingResult.responseCode == BillingClient.BillingResponseCode.OK && purchases != null) {
-            for (purchase in purchases) {
-                handlePurchase(purchase) {
-                    if (null == it) {
-                        paymentCallback?.onFailure(PaymentErrorCode.ERROR)
-                    } else {
-                        paymentCallback?.onSuccess()
-                        paymentCallback = null
-                    }
-                }
-            }
-        } else {
-            paymentCallback?.onFailure(fromBillingResponseCode(billingResult.responseCode))
-        }
-    }
 
     override fun queryPurchases(
-        paymentProductType: PaymentProductType,
+        productType: PaymentProductType,
         callback: QueryPurchasesCallback
     ) {
-        val productType = if (paymentProductType == PaymentProductType.SUBS) {
-            BillingClient.ProductType.SUBS
-        } else {
-            BillingClient.ProductType.INAPP
-        }
+        val billingProductType = productType.toBillingProductType()
+
         billingClient.queryPurchasesAsync(
             QueryPurchasesParams.newBuilder()
-                .setProductType(productType)
+                .setProductType(billingProductType)
                 .build()
         ) { billingResult, purchases ->
-            if (billingResult.responseCode == BillingClient.BillingResponseCode.OK) {
+            if (billingResult.responseCode == BillingResponseCode.OK) {
                 // 查询时不自动处理订单，只返回购买详情供业务层判断
                 val paymentPurchaseDetailsList = purchases.filterNotNull().map {
                     val paymentPurchaseState = when (it.purchaseState) {
@@ -385,33 +388,12 @@ class GoogleBillingProvider(private val context: Context, private val config: Go
     }
 
     /**
-     * 处理购买状态，确认支付状态并执行相关操作，如确认购买、恢复订阅等。
-     *
-     * @param purchase 购买对象。
-     * @param callback 回调函数，用于返回支付成功或失败的状态。
-     */
-    private fun handlePurchase(
-        purchase: Purchase,
-        callback: (response: BillingResponse?) -> Unit
-    ) {
-        // 实现购买结果处理逻辑，例如验证购买，提供相应商品等
-        if (purchaseIsSubs(purchase)) {
-            acknowledgePurchase(purchase, callback)
-        } else if (purchaseIsOtpNonConsumable(purchase)) {
-            acknowledgePurchase(purchase, callback)
-        } else if (purchaseIsOtpConsumable(purchase)) {
-            consumablePurchase(purchase, callback)
-        }
-    }
-
-    /**
-     * 手动确认订单（用于应用重启后恢复未确认的订单）
-     * 适用于订阅商品和一次性非消耗商品
+     * 确认订阅或一次性非消耗商品订单。
      *
      * @param purchaseToken 购买令牌
      * @param callback 确认结果回调
      */
-    fun acknowledgePurchaseByToken(
+    override fun acknowledgePurchase(
         purchaseToken: String,
         callback: (success: Boolean) -> Unit
     ) {
@@ -420,27 +402,23 @@ class GoogleBillingProvider(private val context: Context, private val config: Go
             .build()
         billingClient.acknowledgePurchase(params) { billingResult ->
             val response = BillingResponse(billingResult.responseCode)
-            when {
-                response.isOk -> {
-                    Log.i(TAG, "acknowledgePurchase：成功验证该商品 - token: $purchaseToken")
-                    callback.invoke(true)
-                }
-                else -> {
-                    Log.e(TAG, "acknowledgePurchase 失败：${billingResult.debugMessage}")
-                    callback.invoke(false)
-                }
+            if (response.isOk) {
+                Log.i(TAG, "acknowledgePurchase：成功确认该商品 - token: $purchaseToken")
+                callback.invoke(true)
+            } else {
+                Log.e(TAG, "acknowledgePurchase 失败：${billingResult.debugMessage}")
+                callback.invoke(false)
             }
         }
     }
 
     /**
-     * 手动消费订单（用于应用重启后恢复未消费的订单）
-     * 适用于一次性消耗商品
+     * 消费一次性消耗商品订单。
      *
      * @param purchaseToken 购买令牌
      * @param callback 消费结果回调
      */
-    fun consumePurchaseByToken(
+    override fun consumePurchase(
         purchaseToken: String,
         callback: (success: Boolean) -> Unit
     ) {
@@ -449,110 +427,49 @@ class GoogleBillingProvider(private val context: Context, private val config: Go
             .build()
         billingClient.consumeAsync(consumeParams) { billingResult, purchaseToken ->
             val response = BillingResponse(billingResult.responseCode)
-            when {
-                response.isOk -> {
-                    Log.d(TAG, "consumeAsync: 成功消耗该商品 - token: $purchaseToken")
-                    callback.invoke(true)
-                }
-                else -> {
-                    Log.e(TAG, "consumeAsync 失败：${billingResult.debugMessage}")
-                    callback.invoke(false)
-                }
+            if (response.isOk) {
+                Log.d(TAG, "consumeAsync: 成功消耗该商品 - token: $purchaseToken")
+                callback.invoke(true)
+            } else {
+                Log.e(TAG, "consumeAsync 失败：${billingResult.debugMessage}")
+                callback.invoke(false)
             }
         }
     }
-
-    private fun consumablePurchase(
-        purchase: Purchase,
-        callback: (response: BillingResponse?) -> Unit
-    ) {
-        val consumeParams = ConsumeParams.newBuilder()
-            .setPurchaseToken(purchase.purchaseToken)
-            .build()
-        billingClient.consumeAsync(consumeParams) { billingResult, purchaseToken ->
-            val response = BillingResponse(billingResult.responseCode)
-            when {
-                response.isOk -> {
-                    Log.d(TAG, "consumeAsync: 成功消耗该商品 - token: $purchaseToken")
-                    callback.invoke(response)
-                }
-
-                else -> {
-                    callback.invoke(null)
-                }
-            }
-        }
-    }
-
-
-    private fun acknowledgePurchase(
-        purchase: Purchase,
-        callback: (response: BillingResponse?) -> Unit
-    ) {
-        val purchaseToken = purchase.purchaseToken
-        val params = AcknowledgePurchaseParams.newBuilder()
-            .setPurchaseToken(purchaseToken)
-            .build()
-        billingClient.acknowledgePurchase(params) { billingResult ->
-            val response = BillingResponse(billingResult.responseCode)
-            when {
-                response.isOk -> {
-                    Log.i(TAG, "acknowledgePurchase：成功验证该商品 - token: $purchaseToken")
-                    callback.invoke(response)
-
-                }
-
-                else -> {
-                    callback.invoke(null)
-                }
-            }
-        }
-    }
-
 
     /**
-     * 判断商品是否为订阅类型。
-     *
-     * @param product 商品ID。
-     * @return 如果是订阅类型，返回true；否则返回false。
+     * 清理资源，防止内存泄露。
+     * 在不再需要 GoogleBillingProvider 时调用（如 Activity/Fragment onDestroy）。
      */
-    private fun productIsSubs(product: String): Boolean {
-        return config.subsProducts.contains(product)
-    }
+    override fun cleanup() {
+        // 断开 BillingClient 连接
+        if (::billingClient.isInitialized && billingClient.isReady) {
+            billingClient.endConnection()
+        }
 
-    private fun productIsOtpConsumer(product: String): Boolean {
-        return config.otpConsumerProducts.contains(product)
-    }
-
-    private fun productIsOtpNonConsumer(product: String): Boolean {
-        return config.otpNonConsumerProducts.contains(product)
+        Log.d(TAG, "BillingClient cleaned up")
     }
 
     /**
-     * 判断该订单是否为订阅
+     * 把结算库返回的购买详情映射为 PaymentPurchaseDetails
      * **/
-    private fun purchaseIsSubs(purchase: Purchase): Boolean {
-        return purchase.products.any { product ->
-            product in config.subsProducts
+    private fun mapToPaymentPurchaseDetails(purchase: Purchase): GooglePurchaseDetails {
+        val paymentPurchaseState = when (purchase.purchaseState) {
+            Purchase.PurchaseState.PURCHASED -> PaymentPurchaseState.PURCHASED
+            Purchase.PurchaseState.PENDING -> PaymentPurchaseState.PENDING
+            else -> PaymentPurchaseState.UNSPECIFIED_STATE
         }
+        return GooglePurchaseDetails(
+            orderId = purchase.orderId ?: "",
+            purchaseState = paymentPurchaseState,
+            products = purchase.products,
+            purchaseToken = purchase.purchaseToken,
+            isAcknowledged = purchase.isAcknowledged
+        )
     }
 
-    /**
-     * 判断该订单是否为一次性商品-消耗型
-     * **/
-    private fun purchaseIsOtpConsumable(purchase: Purchase): Boolean {
-        return purchase.products.any { product ->
-            product in config.otpConsumerProducts
-        }
-    }
-
-    /**
-     * 判断该订单是否为一次性商品-非消耗型
-     * **/
-    private fun purchaseIsOtpNonConsumable(purchase: Purchase): Boolean {
-        return purchase.products.any { product ->
-            product in config.otpNonConsumerProducts
-        }
+    private fun mapToPaymentPurchaseList(purchases: List<Purchase>): List<GooglePurchaseDetails> {
+        return purchases.map { mapToPaymentPurchaseDetails(it) }
     }
 
     companion object {
@@ -567,51 +484,52 @@ internal class BillingResponse(val code: Int) {
 
     // 判断响应码是否表示操作成功
     val isOk: Boolean
-        get() = code == BillingClient.BillingResponseCode.OK  // 如果返回的响应码是 OK (0)，表示操作成功。
+        get() = code == BillingResponseCode.OK  // 如果返回的响应码是 OK (0)，表示操作成功。
 
     // 判断响应码是否表示可以优雅失败的情况（例如用户已购买该商品）
     val canFailGracefully: Boolean
-        get() = code == BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED  // 如果返回的是 ITEM_ALREADY_OWNED (7)，表示用户已经拥有该商品，这并不算作错误，系统可以优雅地处理这种情况。
+        get() = code == BillingResponseCode.ITEM_ALREADY_OWNED  // 如果返回的是 ITEM_ALREADY_OWNED (7)，表示用户已经拥有该商品，这并不算作错误，系统可以优雅地处理这种情况。
 
     // 判断响应码是否表示可恢复的错误（例如服务断开或一般错误）
     val isRecoverableError: Boolean
         get() = code in setOf(
-            BillingClient.BillingResponseCode.ERROR,  // 一般错误（1），可能是由于未知原因导致的错误。
-            BillingClient.BillingResponseCode.SERVICE_DISCONNECTED  // 服务断开（2），表示与计费服务的连接断开，通常可以重试。
+            BillingResponseCode.ERROR,  // 一般错误（1），可能是由于未知原因导致的错误。
+            BillingResponseCode.SERVICE_DISCONNECTED  // 服务断开（2），表示与计费服务的连接断开，通常可以重试。
         )
 
     // 判断响应码是否表示不可恢复的错误（例如服务不可用、开发者错误）
     val isNonrecoverableError: Boolean
         get() = code in setOf(
-            BillingClient.BillingResponseCode.SERVICE_UNAVAILABLE,  // 服务不可用（3），表示计费服务不可用，通常是临时性问题。
-            BillingClient.BillingResponseCode.BILLING_UNAVAILABLE,  // 计费不可用（4），表示计费系统不可用。
-            BillingClient.BillingResponseCode.DEVELOPER_ERROR  // 开发者错误（5），通常是开发者配置错误，需修复代码。
+            BillingResponseCode.SERVICE_UNAVAILABLE,  // 服务不可用（3），表示计费服务不可用，通常是临时性问题。
+            BillingResponseCode.BILLING_UNAVAILABLE,  // 计费不可用（4），表示计费系统不可用。
+            BillingResponseCode.DEVELOPER_ERROR  // 开发者错误（5），通常是开发者配置错误，需修复代码。
         )
 
     // 判断响应码是否表示严重的故障，通常是用户行为导致的失败或商品问题
     val isTerribleFailure: Boolean
         get() = code in setOf(
-            BillingClient.BillingResponseCode.ITEM_UNAVAILABLE,  // 商品不可用（6），表示商品已下架或不可购买。
-            BillingClient.BillingResponseCode.FEATURE_NOT_SUPPORTED,  // 功能不支持（8），表示当前设备或地区不支持该功能。
-            BillingClient.BillingResponseCode.ITEM_NOT_OWNED,  // 商品未拥有（9），表示用户没有购买该商品。
-            BillingClient.BillingResponseCode.USER_CANCELED  // 用户取消（10），表示用户手动取消了支付或购买操作。
+            BillingResponseCode.ITEM_UNAVAILABLE,  // 商品不可用（6），表示商品已下架或不可购买。
+            BillingResponseCode.FEATURE_NOT_SUPPORTED,  // 功能不支持（8），表示当前设备或地区不支持该功能。
+            BillingResponseCode.ITEM_NOT_OWNED,  // 商品未拥有（9），表示用户没有购买该商品。
+            BillingResponseCode.USER_CANCELED  // 用户取消（10），表示用户手动取消了支付或购买操作。
         )
 
     companion object {
         // 根据BillingClient的响应码返回对应的PaymentErrorCode
-        fun fromBillingResponseCode(code: Int): PaymentErrorCode {
+        fun fromBillingResponseCode(code: Int): PaymentCode {
             return when (code) {
-                BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED -> PaymentErrorCode.ITEM_ALREADY_OWNED
-                BillingClient.BillingResponseCode.ERROR -> PaymentErrorCode.ERROR
-                BillingClient.BillingResponseCode.SERVICE_DISCONNECTED -> PaymentErrorCode.SERVICE_DISCONNECTED
-                BillingClient.BillingResponseCode.SERVICE_UNAVAILABLE -> PaymentErrorCode.SERVICE_UNAVAILABLE
-                BillingClient.BillingResponseCode.BILLING_UNAVAILABLE -> PaymentErrorCode.BILLING_UNAVAILABLE
-                BillingClient.BillingResponseCode.DEVELOPER_ERROR -> PaymentErrorCode.DEVELOPER_ERROR
-                BillingClient.BillingResponseCode.ITEM_UNAVAILABLE -> PaymentErrorCode.ITEM_UNAVAILABLE
-                BillingClient.BillingResponseCode.FEATURE_NOT_SUPPORTED -> PaymentErrorCode.FEATURE_NOT_SUPPORTED
-                BillingClient.BillingResponseCode.ITEM_NOT_OWNED -> PaymentErrorCode.ITEM_NOT_OWNED
-                BillingClient.BillingResponseCode.USER_CANCELED -> PaymentErrorCode.USER_CANCELED
-                else -> PaymentErrorCode.ERROR
+                BillingResponseCode.OK -> PaymentCode.OK
+                BillingResponseCode.ITEM_ALREADY_OWNED -> PaymentCode.ITEM_ALREADY_OWNED
+                BillingResponseCode.ERROR -> PaymentCode.ERROR
+                BillingResponseCode.SERVICE_DISCONNECTED -> PaymentCode.SERVICE_DISCONNECTED
+                BillingResponseCode.SERVICE_UNAVAILABLE -> PaymentCode.SERVICE_UNAVAILABLE
+                BillingResponseCode.BILLING_UNAVAILABLE -> PaymentCode.BILLING_UNAVAILABLE
+                BillingResponseCode.DEVELOPER_ERROR -> PaymentCode.DEVELOPER_ERROR
+                BillingResponseCode.ITEM_UNAVAILABLE -> PaymentCode.ITEM_UNAVAILABLE
+                BillingResponseCode.FEATURE_NOT_SUPPORTED -> PaymentCode.FEATURE_NOT_SUPPORTED
+                BillingResponseCode.ITEM_NOT_OWNED -> PaymentCode.ITEM_NOT_OWNED
+                BillingResponseCode.USER_CANCELED -> PaymentCode.USER_CANCELED
+                else -> PaymentCode.ERROR
             }
         }
     }

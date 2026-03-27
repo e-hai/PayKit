@@ -4,9 +4,13 @@ package com.kit.pay.base
  * 支付错误代码枚举，用于描述支付过程中可能出现的错误类型。
  */
 /**
- * PaymentErrorCode 枚举类，用于表示支付过程中可能出现的错误状态。
+ * PaymentCode 枚举类，用于表示支付过程中可能出现的错误状态。
  */
-enum class PaymentErrorCode {
+enum class PaymentCode {
+    /**
+     * 表示操作成功。
+     */
+    OK,
 
     /**
      * 一般错误

@@ -7,5 +7,5 @@ interface InitializationCallback {
 
     fun onSuccess()
 
-    fun onFailure(errorCode: PaymentErrorCode)
+    fun onFailure(errorCode: PaymentCode)
 }

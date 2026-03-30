@@ -6,10 +6,10 @@ package com.kit.pay.base
 interface PaymentCallback {
 
     /**
-     * 当支付成功时调用。
-     * 该方法表示支付流程已经完成，用户成功购买了商品或订阅。
+     * 当待支付或支付成功时调用。
+     * 该方法表示支付流程已经完成，用户待支付或成功购买。
      */
-    fun onSuccess()
+    fun onSuccess(purchaseDetails: PaymentPurchaseDetails)
 
     /**
      * 当支付失败时调用。

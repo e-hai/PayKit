@@ -59,7 +59,7 @@ interface PaymentProvider {
         productId: String,
         offerId: String,
         orderId: String,
-        callback: PaymentCallback
+        callback: MakePaymentCallback
     )
 
     /**

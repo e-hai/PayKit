@@ -18,6 +18,7 @@ import com.android.billingclient.api.QueryProductDetailsParams
 import com.android.billingclient.api.QueryPurchasesParams
 import com.android.billingclient.api.UnfetchedProduct
 import com.kit.pay.base.InitializationCallback
+import com.kit.pay.base.MakePaymentCallback
 import com.kit.pay.base.PaymentCallback
 import com.kit.pay.base.PaymentCode
 import com.kit.pay.base.PaymentProductType
@@ -277,7 +278,7 @@ class GoogleBillingProvider(
         productId: String,
         offerId: String,
         orderId: String,
-        callback: PaymentCallback
+        callback: MakePaymentCallback
     ) {
         val billingProductType = productType.toBillingProductType()
 

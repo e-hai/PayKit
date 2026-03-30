@@ -3,6 +3,7 @@ package com.kit.pay
 
 import android.app.Activity
 import com.kit.pay.base.InitializationCallback
+import com.kit.pay.base.MakePaymentCallback
 import com.kit.pay.base.PaymentCallback
 import com.kit.pay.base.PaymentConfig
 import com.kit.pay.base.PaymentCode
@@ -206,78 +207,32 @@ class PaymentManager private constructor() {
     ) {
         when (code) {
             PaymentCode.OK -> {
-                LogUtil.d("生成订单成功")
+                LogUtil.d("生成订单成功=${purchaseDetailList.size}")
                 purchaseDetailList.forEach {
                     if (it.getPurchaseState() == PaymentPurchaseState.PURCHASED) {
-                        LogUtil.d("用户支付成功")
+                        LogUtil.d("用户支付成功，赋予用户使用商品")
+                        activeEntitlements.addAll(it.getProducts())
                     } else if (it.getPurchaseState() == PaymentPurchaseState.PENDING) {
                         LogUtil.d("用户还没支付，提示用户")
                     } else {
                         LogUtil.d("订单状态未知")
                     }
+                    synchronized(waitingPayments) {
+                        waitingPayments.remove(it.getOrderId())?.onSuccess(it)
+                    }
                 }
-            }
-
-            PaymentCode.USER_CANCELED -> {
-                LogUtil.d("用户取消了订单")
             }
 
             else -> {
                 LogUtil.e("发起订单失败: $code")
-            }
-        }
-        val provider = paymentProvider ?: return
-        val config = paymentConfig ?: return
-
-        val products = purchase.getProducts()
-        val orderId = purchase.getOrderId()
-
-        LogUtil.d("处理新订单: $orderId, 商品: $products")
-
-        // 标记权益已激活
-        activeEntitlements.addAll(products)
-
-        // 查找并触发待处理的支付回调
-        synchronized(pendingPayments) {
-            products.forEach { productId ->
-                pendingPayments.remove(productId)?.onSuccess()
-            }
-        }
-
-        when {
-            // 订阅商品或一次性非消耗商品需要确认 (Acknowledge)
-            products.any { config.isSubs(it) || config.isNonConsumable(it) } -> {
-                // 仅处理未确认的订单 (如果是 GooglePurchaseDetails)
-                val needsAcknowledge = if (purchase is GooglePurchaseDetails) {
-                    !purchase.isAcknowledged()
-                } else true
-
-                if (needsAcknowledge) {
-                    val purchaseToken =
-                        if (purchase is GooglePurchaseDetails) purchase.getPurchaseToken() else ""
-                    provider.acknowledgePurchase(purchaseToken) { success ->
-                        if (success) {
-                            LogUtil.i("订单确认成功: $orderId")
-                        }
+                purchaseDetailList.forEach {
+                    synchronized(waitingPayments) {
+                        waitingPayments.remove(it.getOrderId())?.onFailure(code)
                     }
                 }
             }
-
-            // 一次性消耗商品需要消费 (Consume)
-            products.any { config.isConsumable(it) } -> {
-                val purchaseToken =
-                    if (purchase is GooglePurchaseDetails) purchase.getPurchaseToken() else ""
-                provider.consumePurchase(purchaseToken) { success ->
-                    if (success) {
-                        LogUtil.i("订单消费成功: $orderId")
-                    }
-                }
-            }
-
-            else -> {
-                LogUtil.w("未知类型的商品订单: $orderId, 商品: $products")
-            }
         }
+
     }
 
     /**
@@ -312,24 +267,19 @@ class PaymentManager private constructor() {
             waitingPayments[orderId] = callback
         }
 
-
-        provider.makePayment(
-            activity,
-            productType,
-            productId,
-            offerId,
-            orderId,
-            object : PaymentCallback {
+        // 发起支付请求
+        provider.makePayment(activity, productType, productId, offerId, orderId,
+            object : MakePaymentCallback {
                 override fun onSuccess() {
                     // 底层拉起支付流程成功（ launchBillingFlow 返回 OK ），但真正的购买结果通过 handleIncomingPurchase 异步返回
-                    LogUtil.d("支付流程已拉起: $productId")
+                    LogUtil.d("支付流程已拉起: $orderId")
                 }
 
                 override fun onFailure(errorCode: PaymentCode) {
                     // 底层拉起支付流程失败
-                    LogUtil.e("拉起支付流程失败: $productId, error: $errorCode")
+                    LogUtil.e("拉起支付流程失败: $orderId, error: $errorCode")
                     synchronized(waitingPayments) {
-                        waitingPayments.remove(productId)
+                        waitingPayments.remove(orderId)
                     }
                     callback.onFailure(errorCode)
                 }
@@ -366,8 +316,6 @@ class PaymentManager private constructor() {
 
                 purchases.forEach { purchase ->
                     if (purchase.getPurchaseState() == PaymentPurchaseState.PURCHASED) {
-                        // 统一走内部处理逻辑，会自动完成 确认 -> 发放 流程
-                        handleIncomingPurchase(purchase)
                         onOrderRecovered(purchase.getProducts())
                     }
                 }

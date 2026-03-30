@@ -1,5 +1,6 @@
 package com.kit.pay.sample
 
+import android.app.Activity
 import android.app.Application
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
@@ -15,6 +16,8 @@ import com.kit.pay.base.QueryPurchasesCallback
 import com.kit.pay.billing.GoogleBillingProvider
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlin.uuid.ExperimentalUuidApi
+import kotlin.uuid.Uuid
 
 class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 
@@ -80,14 +83,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 
     /**查询可订阅的商品列表**/
     fun actionLoadSubProductList() {
-        // 直接从 PaymentManager 获取缓存的商品详情
-        val products = PaymentManager.getInstance().getProducts()
-        if (products.isNotEmpty()) {
-            _productList.value = products.map { it.getProductId() }
-            Log.d(TAG, "从缓存加载商品列表成功：${products.size}个商品")
-        } else {
-            Log.w(TAG, "缓存商品列表为空，请检查初始化状态")
-        }
+
     }
 
     /**检查是否拥有某项权益**/
@@ -137,15 +133,16 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     /**发起支付**/
-    fun actionPurchase(productId: String, offerId: String = "") {
+    @OptIn(ExperimentalUuidApi::class)
+    fun actionPurchase(activity: Activity, productId: String, offerId: String = "") {
         PaymentManager.getInstance().makePayment(
-            activity = (app as? android.app.Activity) ?: return,
+            activity = activity,
+            key = Uuid.generateV4().toHexString(),
             productId = productId,
             offerId = offerId,
             callback = object : PaymentCallback {
-                override fun onSuccess() {
-                    Log.d(TAG, "支付成功")
-                    // 支付成功后会触发 handlePurchasesUpdated，自动确认/消费订单
+                override fun onSuccess(purchaseDetails: PaymentPurchaseDetails) {
+                    TODO("Not yet implemented")
                 }
 
                 override fun onFailure(errorCode: com.kit.pay.base.PaymentCode) {

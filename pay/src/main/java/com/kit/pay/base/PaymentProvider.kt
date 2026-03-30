@@ -47,18 +47,18 @@ interface PaymentProvider {
      * 发起支付流程。
      *
      * @param activity 当前操作所在的 Activity。
+     * @param key 订单标识，用于跟踪支付结果。（google play billing不提供，得开发者自身生成）
      * @param productId 商品 ID。
      * @param productType 商品类型。
      * @param offerId 优惠方案 ID。
-     * @param orderId 订单 ID，用于跟踪支付结果。（google play billing不提供，得开发者自身生成）
      * @param callback 支付结果回调。
      */
     fun makePayment(
         activity: Activity,
+        key: String,
         productType: PaymentProductType,
         productId: String,
         offerId: String,
-        orderId: String,
         callback: MakePaymentCallback
     )
 

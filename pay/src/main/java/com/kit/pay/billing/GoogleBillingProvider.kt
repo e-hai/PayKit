@@ -266,18 +266,18 @@ class GoogleBillingProvider(
      * 发起支付流程，包括一次性购买和订阅购买。
      *
      * @param activity 当前活动的Activity对象，用于发起支付。
+     * @param key 支付标识符，用于标识当前支付操作。
      * @param productType 产品类型。
      * @param productId 产品ID。
      * @param offerId 订阅优惠ID。
-     * @param orderId 订单ID。
      * @param callback 支付回调，用于返回支付结果。
      */
     override fun makePayment(
         activity: Activity,
+        key: String,
         productType: PaymentProductType,
         productId: String,
         offerId: String,
-        orderId: String,
         callback: MakePaymentCallback
     ) {
         val billingProductType = productType.toBillingProductType()
@@ -335,7 +335,7 @@ class GoogleBillingProvider(
                     //  功能联动：通常需要与 DeveloperBillingOptionParams 等类配合使用，用以定义具体的支付详情
                     val billingFlowParams = BillingFlowParams.newBuilder()
 //                        .enableDeveloperBillingOption()
-                        .setObfuscatedAccountId(orderId) //使用用户账号ID的位置来透传订单ID
+                        .setObfuscatedAccountId(key) //使用用户账号ID的位置来透传订单标识
 //                        .setObfuscatedProfileId()
 //                        .setSubscriptionUpdateParams()
                         .setProductDetailsParamsList(productDetailsParamsList)
@@ -374,7 +374,7 @@ class GoogleBillingProvider(
                         else -> PaymentPurchaseState.UNSPECIFIED_STATE
                     }
                     GooglePurchaseDetails(
-                        orderId = it.orderId ?: "",
+                        key = it.accountIdentifiers?.obfuscatedAccountId ?: "",
                         purchaseState = paymentPurchaseState,
                         products = it.products,
                         purchaseToken = it.purchaseToken,
@@ -461,7 +461,7 @@ class GoogleBillingProvider(
             else -> PaymentPurchaseState.UNSPECIFIED_STATE
         }
         return GooglePurchaseDetails(
-            orderId = purchase.orderId ?: "",
+            key = purchase.accountIdentifiers?.obfuscatedAccountId ?: "",
             purchaseState = paymentPurchaseState,
             products = purchase.products,
             purchaseToken = purchase.purchaseToken,

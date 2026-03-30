@@ -6,11 +6,11 @@ package com.kit.pay.base
 interface PaymentPurchaseDetails {
 
     /**
-     * 获取订单 ID。
+     * 获取订单 标识。
      *
      * @return 订单的唯一标识符。
      */
-    fun getOrderId(): String
+    fun getKey(): String
 
     /**
      * 获取购买状态。

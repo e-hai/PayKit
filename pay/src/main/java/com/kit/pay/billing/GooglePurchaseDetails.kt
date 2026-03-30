@@ -5,15 +5,15 @@ import com.kit.pay.base.PaymentPurchaseState
 
 
 data class GooglePurchaseDetails(
-    private val orderId: String,
+    private val key: String,
     private val purchaseState: PaymentPurchaseState,
     private val products: List<String>,
     private val purchaseToken: String = "",
     private val isAcknowledged: Boolean = false
 ) : PaymentPurchaseDetails {
 
-    override fun getOrderId(): String {
-        return orderId
+    override fun getKey(): String {
+        return  key
     }
 
     override fun getPurchaseState(): PaymentPurchaseState {

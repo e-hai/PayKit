@@ -1,42 +1,162 @@
 # Payment SDK 集成指南
 
-## 简介
+## 📖 简介
 
-Payment SDK 是一个专为 Android 应用设计的支付结算库，目前仅支持 Google Play结算系统。该 SDK 提供了完整的支付流程管理，包括商品查询、支付发起、订单确认、订阅状态检查等功能。
+Payment SDK 是一个专为 Android 应用设计的支付结算库，目前仅支持 Google Play 结算系统。该 SDK 提供了完整的支付流程管理，包括商品查询、支付发起、订单确认、订阅状态检查等功能。
 
-## 核心架构
+**核心特性：**
+- ✅ 完整的支付流程封装
+- ✅ 自动处理订单确认和权益发放
+- ✅ 支持订阅商品、一次性消耗商品、一次性非消耗商品
+- ✅ 内置订单恢复机制，防止掉单
+- ✅ 线程安全，支持多模块并发调用
+- ✅ 符合 Google Play 最新政策（欧盟个性化报价）
 
-### 主要组件
+## 🏗️ 核心架构
 
-1. **PaymentManager** - 支付管理器（单例）
-   - 管理支付逻辑的核心类
-   - 支持延迟任务队列，确保初始化完成后再执行支付操作
-   - 提供统一的 API 接口进行支付相关操作
+### 1. PaymentManager - 支付管理器（单例）
 
-2. **PaymentProvider** - 支付提供者接口
-   - 定义了支付服务的核心操作
-   - 当前实现：`GoogleBillingProvider`
+**职责：** 管理支付逻辑的核心类，提供统一的 API 接口
 
-3. **GoogleBillingProvider** - Google Play结算实现
-   - 实现了与 Google Play Billing Library 的交互
-   - 提供连接管理、重试机制、购买处理等功能
-   - 自动处理不同商品类型的确认和消费逻辑
+**主要功能：**
+- 初始化支付提供者
+- 商品查询和管理
+- 支付发起和回调处理
+- 订单恢复和权益同步
+- 订阅状态检查
 
-4. **GoogleBillingConfig** - 配置类
-   - 配置订阅商品、一次性消耗商品、一次性非消耗商品的 ID 列表
+**关键方法：**
+```kotlin
+// 初始化 SDK
+fun init(provider: PaymentProvider, config: PaymentConfig, callback: InitializationCallback)
 
-### 数据模型
+// 查询商品详情
+fun queryProducts(productIds: List<String>, callback: QueryProductsCallback)
 
-- **PaymentProductType**: 商品类型（订阅/一次性）
-- **SubscriptionStatus**: 订阅状态（未初始化/已订阅/未订阅）
-- **PaymentPurchaseState**: 购买状态（未指明/已支付/待处理）
-- **PaymentErrorCode**: 错误代码枚举
+// 发起支付
+fun makePayment(activity: Activity, key: String, productId: String, offerId: String, callback: PaymentCallback)
+
+// 恢复未完成订单
+fun recoverUnfinishedOrders(productType: PaymentProductType, onOrderRecovered: (purchase) -> Unit, onComplete: () -> Unit)
+
+// 检查是否拥有某项权益
+fun isEntitled(productId: String): Boolean
+```
+
+### 2. PaymentProvider - 支付提供者接口
+
+**职责：** 定义支付服务的核心操作，支持扩展不同的支付平台
+
+**当前实现：** `GoogleBillingProvider`（Google Play 结算）
+
+**核心方法：**
+```kotlin
+interface PaymentProvider {
+    fun initialize(callback: InitializationCallback)
+    fun queryProducts(products: List<Pair<String, PaymentProductType>>, callback: QueryProductsCallback)
+    fun makePayment(activity: Activity, key: String, productType: PaymentProductType, productId: String, offerId: String, callback: MakePaymentCallback)
+    fun acknowledgePurchase(purchaseToken: String, callback: (Boolean) -> Unit)
+    fun consumePurchase(purchaseToken: String, callback: (Boolean) -> Unit)
+    fun queryPurchases(productType: PaymentProductType, callback: QueryPurchasesCallback)
+}
+```
+
+### 3. GoogleBillingProvider - Google Play 结算实现
+
+**职责：** 实现与 Google Play Billing Library 的交互
+
+**核心功能：**
+- 连接管理和自动重连
+- 购买监听和回调处理
+- 商品详情查询
+- 订单确认和消费
+- 待处理订单支持
+
+**配置参数：**
+```kotlin
+class GoogleBillingProvider(private val app: Application) : PaymentProvider {
+    // 内部使用 BillingClient 8.3.0
+    // 启用待处理购买支持
+    // 启用自动服务重连
+}
+```
+
+### 4. PaymentConfig - 商品配置类
+
+**职责：** 配置各类商品的 ID 列表，用于识别商品类型
+
+**使用示例：**
+```kotlin
+val config = PaymentConfig(
+    subsProducts = listOf("SUBS_PRODUCT_MONTH", "SUBS_PRODUCT_YEAR"),      // 订阅商品
+    consumableProducts = listOf("OTP_GAME_SKIN_3DAY"),                      // 一次性消耗商品
+    nonConsumableProducts = listOf("OTP_GAME_SKIN_PERMANENT")               // 一次性非消耗商品
+)
+```
+
+### 5. 数据模型详解
+
+#### **商品详情（PaymentProductDetails）**
+```kotlin
+data class PaymentProductDetails(
+    val productId: String,           // 商品 ID
+    val title: String,               // 商品标题
+    val description: String,         // 商品描述
+    val productType: PaymentProductType  // 商品类型
+)
+```
+
+#### **订单详情（PaymentPurchaseDetails）**
+```kotlin
+data class PaymentPurchaseDetails(
+    val key: String,                 // 订单标识（开发者传入的用户 ID）
+    val orderId: String,             // Google Play 订单 ID
+    val purchaseState: PaymentPurchaseState,  // 购买状态
+    val products: List<String>,      // 商品 ID 列表
+    val purchaseToken: String,       // 购买令牌（确认/消费必备）
+    val isAcknowledged: Boolean      // 是否已确认
+)
+```
+
+#### **商品类型枚举**
+```kotlin
+enum class PaymentProductType {
+    SUBS,    // 订阅商品（包月/包年）
+    INAPP    // 一次性商品（消耗型/非消耗型）
+}
+```
+
+#### **购买状态枚举**
+```kotlin
+enum class PaymentPurchaseState {
+    UNSPECIFIED_STATE,  // 未指明状态
+    PURCHASED,          // 已支付
+    PENDING             // 待处理（延迟支付）
+}
+```
+
+#### **错误码枚举**
+```kotlin
+enum class PaymentCode {
+    OK,                      // 成功
+    ITEM_ALREADY_OWNED,      // 商品已购买
+    ERROR,                   // 一般错误
+    SERVICE_DISCONNECTED,    // 服务断开
+    SERVICE_UNAVAILABLE,     // 服务不可用
+    BILLING_UNAVAILABLE,     // 计费不可用
+    DEVELOPER_ERROR,         // 开发者错误
+    ITEM_UNAVAILABLE,        // 商品不可用
+    FEATURE_NOT_SUPPORTED,   // 功能不支持
+    ITEM_NOT_OWNED,          // 商品未购买
+    USER_CANCELED            // 用户取消
+}
+```
 
 ---
 
-## 集成流程
+## 🚀 快速集成
 
-### 第一步：添加依赖
+### 步骤 1：添加 Gradle 依赖
 
 在 `build.gradle` 中添加：
 
@@ -49,49 +169,79 @@ dependencies {
 }
 ```
 
-### 第二步：配置商品信息
+### 步骤 2：在 Google Play Console 配置商品
 
-创建 `GoogleBillingConfig` 配置对象，定义各类商品 ID：
+**2.1 创建商品**
+
+登录 [Google Play Console](https://play.google.com/console)，进入「获利」>「商品管理」：
+
+**订阅商品（Subscriptions）：**
+- 创建订阅组（如 "Premium Membership"）
+- 在订阅组内创建基础方案（Base Plan），如 "Monthly", "Yearly"
+- 可选：创建优惠方案（Offer），如 "Free Trial", "Introductory Price"
+
+**一次性商品（In-app Products）：**
+- 创建 Managed Product
+- 设置价格和销售地区
+
+**2.2 记录商品 ID**
+
+在代码中配置商品 ID 映射：
 
 ```kotlin
-val config = GoogleBillingConfig(
+val config = PaymentConfig(
     subsProducts = listOf("SUBS_PRODUCT_MONTH", "SUBS_PRODUCT_YEAR"),      // 订阅商品
-    otpConsumerProducts = listOf("OTP_GAME_SKIN_3DAY"),                     // 一次性消耗商品
-    otpNonConsumerProducts = listOf("OTP_GAME_SKIN_PERMANENT")              // 一次性非消耗商品
+    consumableProducts = listOf("OTP_GAME_SKIN_3DAY"),                     // 一次性消耗商品
+    nonConsumableProducts = listOf("OTP_GAME_SKIN_PERMANENT")              // 一次性非消耗商品
 )
 ```
 
-### 第三步：初始化支付管理器
+### 步骤 3：初始化支付管理器
 
-在 Application 或 MainActivity 中初始化：
+**在 Application 或 MainActivity 中初始化：**
 
 ```kotlin
 class MainViewModel(private val app: Application) : AndroidViewModel(app) {
-    fun init() {
-        val config = GoogleBillingConfig(...)
-        val paymentProvider = GoogleBillingProvider(app.applicationContext, config)
-        
-        // 推荐：传入初始化回调，感知 SDK 状态
-        PaymentManager.getInstance().setPaymentProvider(paymentProvider, object : InitializationCallback {
-            override fun onSuccess() {
-                Log.d(TAG, "SDK 初始化成功")
-                // 初始化成功后再调用其他方法
-            }
 
-            override fun onFailure(errorCode: PaymentErrorCode) {
-                Log.e(TAG, "SDK 初始化失败：$errorCode")
-                // 处理失败，比如重试或提示用户
+    fun init() {
+        // 1. 加载配置
+        val config = PaymentConfig(
+            subsProducts = listOf(Constants.SUBS_PRODUCT_MONTH, Constants.SUBS_PRODUCT_YEAR),
+            consumableProducts = listOf(Constants.OTP_GAME_SKIN_3DAY),
+            nonConsumableProducts = listOf(Constants.OTP_GAME_SKIN_PERMANENT)
+        )
+        
+        // 2. 创建支付提供者
+        val paymentProvider = GoogleBillingProvider(app)
+        
+        // 3. 初始化 SDK（推荐：使用初始化回调）
+        PaymentManager.getInstance().init(
+            provider = paymentProvider,
+            config = config,
+            callback = object : InitializationCallback {
+                override fun onSuccess() {
+                    Log.d(TAG, "SDK 初始化成功")
+                    // 初始化成功后，恢复未完成订单并检查 VIP 状态
+                    actionRecoverUnfinishedOrders()
+                    actionCheckVipStatus()
+                }
+
+                override fun onFailure(errorCode: PaymentCode) {
+                    Log.e(TAG, "SDK 初始化失败：$errorCode")
+                    // 即使初始化失败，也尝试检查本地 VIP 状态
+                    checkLocalVipStatus()
+                }
             }
-        })
+        )
     }
 }
 ```
 
 ---
 
-## 使用指南
+## 💡 使用指南
 
-### 1. 查询商品详情
+### 场景 1：查询商品详情并展示
 
 从服务端或 Firebase 获取商品 ID 列表后，查询商品详细信息：
 
@@ -99,71 +249,205 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 PaymentManager.getInstance().queryProducts(
     productIds = listOf("SUBS_PRODUCT_MONTH", "OTP_GAME_SKIN_PERMANENT"),
     callback = object : QueryProductsCallback {
-        override fun onQuerySuccess(products: List<PaymentProductDetails>) {
-            // 展示商品详情（价格、描述等）
+        override fun onQuerySuccess(
+            products: List<PaymentProductDetails>,
+            unfetchedProductIds: List<String>
+        ) {
+            // 处理查询到的商品
+            products.forEach { product ->
+                Log.d(TAG, "商品 - ID: ${product.productId}")
+                Log.d(TAG, "标题：${product.title}")
+                Log.d(TAG, "描述：${product.description}")
+                Log.d(TAG, "类型：${product.productType}")
+                
+                when (product.productType) {
+                    PaymentProductType.SUBS -> {
+                        // 订阅商品：显示价格周期（如 $9.99/月）
+                        showSubscriptionProduct(product)
+                    }
+                    PaymentProductType.INAPP -> {
+                        // 一次性商品：显示固定价格
+                        showOneTimeProduct(product)
+                    }
+                }
+            }
+            
+            // 处理未找到的商品
+            if (unfetchedProductIds.isNotEmpty()) {
+                Log.w(TAG, "以下商品未找到：$unfetchedProductIds")
+                // 可能原因：
+                // 1. 商品 ID 配置错误
+                // 2. 商品在 Google Play 后台未上架
+                // 3. 应用签名与 Google Play 不一致
+            }
         }
-        
-        override fun onQueryFailure(errorCode: PaymentErrorCode) {
-            // 处理查询失败
+
+        override fun onQueryFailure(errorCode: PaymentCode) {
+            Log.e(TAG, "查询商品失败：$errorCode")
+            showError("查询失败：${getErrorMessage(errorCode)}")
         }
     }
 )
 ```
 
-### 2. 检查订阅状态
-
-在应用启动或订阅页面加载时检查用户订阅状态：
-
+**快捷方法：**
 ```kotlin
-PaymentManager.getInstance().checkSubscriptionStatus { status ->
-    when (status) {
-        SubscriptionStatus.SUBSCRIBED -> // 用户已订阅
-        SubscriptionStatus.NOT_SUBSCRIBED -> // 用户未订阅
-        SubscriptionStatus.NOT_INITIALIZED -> // 初始化未完成
-    }
-}
+// 查询所有订阅商品
+PaymentManager.getInstance().querySubsProducts(callback)
+
+// 查询所有一次性消耗商品
+PaymentManager.getInstance().queryConsumableProducts(callback)
+
+// 查询所有一次性非消耗商品
+PaymentManager.getInstance().queryNonConsumableProducts(callback)
 ```
 
-### 3. 发起支付
+### 场景 2：发起支付（订阅/一次性商品）
 
 用户选择商品后，发起支付流程：
 
 ```kotlin
-PaymentManager.getInstance().makePayment(
-    activity = this,
-    productId = "SUBS_PRODUCT_MONTH",
-    offerId = "basicmonthly",  // 订阅优惠方案 ID
-    callback = object : PaymentCallback {
-        override fun onSuccess() {
-            // 支付成功，等待订单确认回调
+@OptIn(ExperimentalUuidApi::class)
+fun purchaseProduct(activity: Activity, productId: String) {
+    PaymentManager.getInstance().makePayment(
+        activity = activity,
+        key = Uuid.generateV4().toHexString(),  // 订单标识（建议使用 UUID）
+        productId = productId,
+        offerId = "basicmonthly",  // 订阅优惠方案 ID，一次性商品可传空串
+        callback = object : PaymentCallback {
+            override fun onSuccess(purchaseDetails: PaymentPurchaseDetails) {
+                Log.d(TAG, "支付成功 - 订单号：${purchaseDetails.orderId}")
+                Log.d(TAG, "商品：${purchaseDetails.products}")
+                Log.d(TAG, "是否已确认：${purchaseDetails.isAcknowledged}")
+                
+                // 支付成功且已自动确认，立即发放权益
+                grantVipEntitlement()
+            }
+
+            override fun onConfirmFailed(purchaseDetails: PaymentPurchaseDetails) {
+                Log.e(TAG, "支付成功但确认失败 - 订单号：${purchaseDetails.orderId}")
+                // 用户已付款，但确认操作失败
+                // 提示用户：“支付已成功，系统正在处理中，请稍后查看权益到账情况”
+                // 需要开发者主动确认
+            }
+
+            override fun onPending(purchaseDetails: PaymentPurchaseDetails) {
+                Log.d(TAG, "支付待处理 - 订单号：${purchaseDetails.orderId}")
+                // 用户使用了延迟支付方式（如银行转账、信用卡分期等）
+                // 提示用户：“支付申请已提交，等待支付平台确认后发放权益”
+            }
+
+            override fun onUserCancel() {
+                Log.d(TAG, "用户取消了支付")
+                // 用户在支付流程中主动取消
+                showToast("已取消支付，如需购买请重新下单")
+            }
+
+            override fun onFailure(errorCode: PaymentCode) {
+                Log.e(TAG, "支付失败 - 错误码：$errorCode")
+                // 支付失败（网络问题、服务错误等）
+                val message = when (errorCode) {
+                    PaymentCode.SERVICE_DISCONNECTED -> "网络连接失败，请检查网络后重试"
+                    PaymentCode.SERVICE_UNAVAILABLE -> "支付服务暂时不可用，请稍后重试"
+                    PaymentCode.ITEM_UNAVAILABLE -> "商品已下架或不可用"
+                    else -> "支付失败，请重试"
+                }
+                showToast(message)
+            }
         }
-        
-        override fun onFailure(errorCode: PaymentErrorCode) {
-            // 支付失败处理
-        }
-    }
-)
+    )
+}
 ```
 
-### 4. 查询已购买商品
+**完整示例：不同类型的商品购买**
+```kotlin
+// 购买包月订阅
+actionPurchase(activity, Constants.SUBS_PRODUCT_MONTH, Constants.BASIC_MONTHLY_PLAN)
 
-查询用户已购买的订阅或一次性商品：
+// 购买包年订阅
+actionPurchase(activity, Constants.SUBS_PRODUCT_YEAR, Constants.BASIC_YEARLY_PLAN)
+
+// 购买一次性消耗商品（如游戏金币）
+actionPurchase(activity, Constants.OTP_GAME_SKIN_3DAY)
+
+// 购买一次性非消耗商品（如永久皮肤）
+actionPurchase(activity, Constants.OTP_GAME_SKIN_PERMANENT)
+```
+
+### 场景 3：检查用户权益状态
+
+在应用启动或订阅页面加载时检查用户权益状态：
 
 ```kotlin
-// 查询订阅商品
-PaymentManager.getInstance().queryPurchases(
-    productType = PaymentProductType.SUBS,
-    callback = object : QueryPurchasesCallback {
-        override fun onQuerySuccess(purchases: List<PaymentPurchaseDetails>) {
-            // 处理已购买列表
-        }
-        
-        override fun onQueryFailure(errorCode: PaymentErrorCode) {
-            // 处理查询失败
-        }
-    }
-)
+// 检查是否拥有某项商品的权益
+fun isProductPurchased(productId: String): Boolean {
+    return PaymentManager.getInstance().isEntitled(productId)
+}
+
+// 检查订阅状态
+val isVip = isProductPurchased(Constants.SUBS_PRODUCT_MONTH) ||
+            isProductPurchased(Constants.SUBS_PRODUCT_YEAR)
+
+if (isVip) {
+    // 用户已订阅，解锁 VIP 功能
+    unlockVipFeatures()
+} else {
+    // 用户未订阅，引导购买
+    showUpgradePrompt()
+}
 ```
+
+**获取所有活跃权益：**
+```kotlin
+// 获取所有活跃的订阅
+val activeSubscriptions = PaymentManager.getInstance().getActiveSubscriptions()
+
+// 获取所有活跃的非消耗商品
+val activeNonConsumables = PaymentManager.getInstance().getActiveNonConsumables()
+```
+
+### 场景 4：恢复未完成订单（防止掉单）
+
+**重要：** 每次应用启动时，必须调用此方法恢复未完成的订单，确保用户权益不丢失。
+
+```kotlin
+fun actionRecoverUnfinishedOrders() {
+    // 恢复订阅商品
+    PaymentManager.getInstance().recoverUnfinishedOrders(
+        productType = PaymentProductType.SUBS,
+        onOrderRecovered = { purchase ->
+            Log.d(TAG, "订阅商品已恢复：${purchase.products}, 订单号：${purchase.orderId}")
+            // 可根据业务需要处理恢复的订单
+        },
+        onComplete = {
+            Log.d(TAG, "订阅商品恢复完成")
+            actionCheckVipStatus()
+        }
+    )
+    
+    // 恢复一次性商品
+    PaymentManager.getInstance().recoverUnfinishedOrders(
+        productType = PaymentProductType.INAPP,
+        onOrderRecovered = { purchase ->
+            Log.d(TAG, "一次性商品已恢复：${purchase.products}, 订单号：${purchase.orderId}")
+        },
+        onComplete = {
+            Log.d(TAG, "一次性商品恢复完成")
+        }
+    )
+}
+```
+
+**为什么需要恢复订单？**
+- 用户在支付过程中应用被强退
+- 网络问题导致确认失败
+- 跨设备购买需要同步权益
+- Google Play 补发历史订单
+
+**最佳实践：**
+- 在 `Application.onCreate()` 或 `MainActivity.onCreate()` 中调用
+- 在 SDK 初始化成功后立即调用
+- 提供“恢复购买”按钮供用户手动触发
 
 ---
 

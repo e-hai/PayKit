@@ -21,8 +21,10 @@ import com.kit.pay.base.InitializationCallback
 import com.kit.pay.base.MakePaymentCallback
 import com.kit.pay.base.PaymentCallback
 import com.kit.pay.base.PaymentCode
+import com.kit.pay.base.PaymentProductDetails
 import com.kit.pay.base.PaymentProductType
 import com.kit.pay.base.PaymentProvider
+import com.kit.pay.base.PaymentPurchaseDetails
 import com.kit.pay.base.PaymentPurchaseState
 import com.kit.pay.base.PurchaseCallback
 import com.kit.pay.base.QueryProductsCallback
@@ -81,7 +83,7 @@ class GoogleBillingProvider(
             override fun onBillingSetupFinished(billingResult: BillingResult) {
                 if (billingResult.responseCode == BillingResponseCode.OK) {
                     callback.onSuccess()  // 通知初始化成功
-                    Log.w(TAG, "google play billing 初始化成功")
+                    LogUtil.d("google play billing 初始化成功")
                 } else {
                     LogUtil.e("google play billing 初始化失败")
                     callback.onFailure(fromBillingResponseCode(billingResult.responseCode))
@@ -90,7 +92,7 @@ class GoogleBillingProvider(
             }
 
             override fun onBillingServiceDisconnected() {
-                Log.w(TAG, "Initialization Disconnected")
+                LogUtil.e("Igoogle play billing 已经断开连接")
                 //已开启 enableAutoServiceReconnection() 自动重新建立连接，因此该方法留空，无需再实现重连逻辑
             }
         })
@@ -162,27 +164,25 @@ class GoogleBillingProvider(
                     } else {
                         PaymentProductType.INAPP
                     }
-                    GoogleProductDetails(
-                        it.productId,
-                        it.title,
-                        it.description,
-                        paymentProductType
+                    PaymentProductDetails(
+                        productId = it.productId,
+                        title = it.title,
+                        description = it.description,
+                        productType = paymentProductType
                     )
                 }
 
                 // 2. 处理未获取到的商品 (UnfetchedProduct)
-                val unfetchedProductIds = queryProductDetailsResult.unfetchedProductList.map { unfetched ->
-                    logUnfetchedProduct(unfetched)
-                    unfetched.productId
+                val unfetchedProductIds = queryProductDetailsResult.unfetchedProductList.map {
+                    logUnfetchedProduct(it)
+                    it.productId
                 }
 
                 // 返回查询结果，包括成功和失败的部分
+                LogUtil.d("查询商品成功")
                 callback.onQuerySuccess(paymentProductDetailsList, unfetchedProductIds)
             } else {
-                Log.e(
-                    TAG,
-                    "onProductDetailsResponse Error: ${response.code} ${billingResult.debugMessage}"
-                )
+                LogUtil.e("查询商品失败: ${response.code} ${billingResult.debugMessage}")
                 callback.onQueryFailure(fromBillingResponseCode(billingResult.responseCode))
             }
         }
@@ -205,8 +205,7 @@ class GoogleBillingProvider(
      * **/
     private fun logUnfetchedProduct(unfetchedProduct: UnfetchedProduct?) {
         unfetchedProduct ?: return
-        Log.d(
-            TAG,
+        LogUtil.d(
             "未获取到的商品- ID:${unfetchedProduct.productId} " +
                     "类型:${unfetchedProduct.productType}" +
                     " 状态:${unfetchedProduct.statusCode}"
@@ -220,45 +219,154 @@ class GoogleBillingProvider(
      */
     private fun logProductDetails(productDetails: ProductDetails?) {
         productDetails ?: return
-        Log.d(
-            TAG,
+        LogUtil.d(
             "商品- ID:${productDetails.productId} " +
                     "类型:${productDetails.productType} " +
                     "名称:${productDetails.name} " +
                     "标题:${productDetails.title} " +
                     "简介:${productDetails.description}"
         )
+
+        // 订阅商品详情
         productDetails.subscriptionOfferDetails?.forEach { sub ->
-            Log.d(
-                TAG,
-                "订阅商品- 基础方案ID:${sub.basePlanId} " +
-                        "优惠ID:${sub.offerId} " +
-                        "优惠token:${sub.offerToken}"
-            )
-            sub.offerTags.forEach { tag ->
-                Log.d(TAG, "优惠标签- $tag")
-            }
-            //关于有效期单位（billingPeriod），遵循 ISO 8601格式： P1W 代表一周, P1M 代表一个月, P3M 代表三个月, P6M 代表6个月,  P1Y 代表一年.
-            //例如，对于FormattedPrice$6.99和billingPeriod P1M，如果billingCycleCount为2，则用户将收取6.99美元/月的费用，为期2个月。
-            sub.pricingPhases.pricingPhaseList.forEach { pricing ->
-                Log.d(
-                    TAG,
-                    "定价阶段- 价格:${pricing.priceAmountMicros} " +
-                            "货币代号:${pricing.priceCurrencyCode} " +
-                            "格式化价格(货币符号+价格):${pricing.formattedPrice} " +
-                            "有效期数：${pricing.billingCycleCount} 有效期单位：${pricing.billingPeriod}" +
-                            "计费的循环模式：${pricing.recurrenceMode}"
-                )
-            }
+            logSubscriptionOfferDetails(sub)
         }
-        productDetails.oneTimePurchaseOfferDetails?.apply {
-            Log.d(
-                TAG,
-                "一次性商品- 价格:${priceAmountMicros} " +
-                        "货币代号:${priceCurrencyCode} " +
-                        "格式化价格(货币符号+价格):${formattedPrice}"
+
+        // 仅一次性商品，新版 API (Billing Library 5.0+)，支持多个优惠方案
+        // 适用于：电影租赁、预售商品、限时优惠等特殊场景
+        productDetails.oneTimePurchaseOfferDetailsList?.forEach { oneTime ->
+            logOneTimePurchaseOfferDetails(oneTime)
+        }
+
+        // 仅一次性商品，旧版 API，看源码等同于productDetails.oneTimePurchaseOfferDetailsList?.first()，
+        // 一般来说直接用oneTimePurchaseOfferDetailsList即可
+        productDetails.oneTimePurchaseOfferDetails?.let {
+            logOneTimePurchaseOfferDetails(it)
+        }
+    }
+
+    private fun logSubscriptionOfferDetails(sub: ProductDetails.SubscriptionOfferDetails) {
+        LogUtil.d(
+            """
+            
+            ┌─────────────────────────────────────┐
+            │ 订阅商品优惠方案                        
+            ├─────────────────────────────────────┤
+            ├─ 基础信息:
+            │  ├─ 基础方案 ID: ${sub.basePlanId}
+            │  ├─ 优惠 ID: ${sub.offerId ?: "无"}
+            │  ├─ 优惠 Token: ${sub.offerToken} ⭐支付必备
+            │  └─ 优惠标签：${sub.offerTags.joinToString(", ").ifEmpty { "无" }}
+            """.trimIndent()
+        )
+
+        // 分期付款计划详情
+        sub.installmentPlanDetails?.let { installment ->
+            val totalMonths = installment.installmentPlanCommitmentPaymentsCount
+            val remainingMonths = installment.subsequentInstallmentPlanCommitmentPaymentsCount
+            val paidMonths = totalMonths - remainingMonths
+
+            LogUtil.d(
+                """
+                ├─ 分期付款计划:
+                │  ├─ 总分期期数：$totalMonths 个月
+                │  ├─ 剩余期数：$remainingMonths 个月
+                │  ├─ 已付期数：$paidMonths 个月
+                │  └─ 说明：用户承诺支付$totalMonths 个月，目前还剩$remainingMonths 个月未付
+                """.trimIndent()
             )
         }
+
+        // 定价阶段详情
+        LogUtil.d("├─ 定价阶段 (共 ${sub.pricingPhases.pricingPhaseList.size} 个):")
+
+        //关于有效期单位（billingPeriod），遵循 ISO 8601 格式： P1W 代表一周，P1M 代表一个月，P3M 代表三个月，P6M 代表 6 个月，P1Y 代表一年.
+        //例如，对于 FormattedPrice$6.99 和 billingPeriod P1M，如果 billingCycleCount 为 2，则用户将收取 6.99 美元/月的费用，为期 2 个月。
+        sub.pricingPhases.pricingPhaseList.forEachIndexed { index, pricing ->
+            val recurrenceModeText = when (pricing.recurrenceMode) {
+                1 -> "无限循环 (正常订阅)"
+                2 -> "有限循环 (${pricing.billingCycleCount}次)"
+                3 -> "非循环 (一次性)"
+                else -> "未知模式 (${pricing.recurrenceMode})"
+            }
+
+            val phaseDescription = when {
+                pricing.priceAmountMicros == 0L -> "【免费试用】"
+                pricing.billingCycleCount > 0 -> "【优惠期：${pricing.billingCycleCount}个周期后恢复原价】"
+                pricing.recurrenceMode == 1 -> "【正常订阅价格】"
+                else -> ""
+            }
+
+            LogUtil.d(
+                """
+                │  阶段 #${index + 1} $phaseDescription
+                │  ├─ 价格 (微美元): ${pricing.priceAmountMicros}
+                │  ├─ 货币代号：${pricing.priceCurrencyCode}
+                │  ├─ 格式化价格：${pricing.formattedPrice}
+                │  ├─ 计费周期：${pricing.billingPeriod} (ISO 8601 格式)
+                │  ├─ 周期数量：${pricing.billingCycleCount}
+                │  └─ 循环模式：$recurrenceModeText
+                """.trimIndent()
+            )
+        }
+
+        LogUtil.d("└─────────────────────────────────────\n")
+    }
+
+    private fun logOneTimePurchaseOfferDetails(oneTime: ProductDetails.OneTimePurchaseOfferDetails) {
+        LogUtil.d(
+            """
+                        
+                ┌─────────────────────────────────────┐
+                │ 一次性商品优惠方案                        
+                ├─────────────────────────────────────┤
+                ├─ 价格信息:
+                │  ├─ 当前价格 (微美元): ${oneTime.priceAmountMicros}
+                │  ├─ 货币代号：${oneTime.priceCurrencyCode}
+                │  └─ 格式化价格：${oneTime.formattedPrice}
+                ├─ 优惠标识:
+                │  ├─ 优惠 ID: ${oneTime.offerId ?: "无"}
+                │  ├─ 优惠 Token: ${oneTime.offerToken} ⭐支付必备
+                │  └─ 优惠标签：${oneTime.offerTags?.joinToString(", ") ?: "无"}
+                ├─ 折扣信息:
+                │  ├─ 折扣金额：${oneTime.discountDisplayInfo?.discountAmount ?: "无"} 微美元
+                │  ├─ 折扣比例：${oneTime.discountDisplayInfo?.percentageDiscount ?: "无"}%
+                │  └─ 原价：${oneTime.fullPriceMicros ?: "无"} 微美元
+                ├─ 限购信息:
+                │  ├─ 最大购买数量：${oneTime.limitedQuantityInfo?.maximumQuantity ?: "无限制"}
+                │  └─ 剩余可购数量：${oneTime.limitedQuantityInfo?.remainingQuantity ?: "未知"}
+                ├─ 预售信息:
+                │  ├─ 预售释放时间：${
+                oneTime.preorderDetails?.preorderReleaseTimeMillis?.let {
+                    java.util.Date(
+                        it
+                    ).toString()
+                } ?: "非预售"
+            }
+                │  └─ 预售结束时间：${
+                oneTime.preorderDetails?.preorderPresaleEndTimeMillis?.let {
+                    java.util.Date(
+                        it
+                    ).toString()
+                } ?: "无"
+            }
+                ├─ 租赁信息 (如适用):
+                │  ├─ 租赁周期：${oneTime.rentalDetails?.rentalPeriod ?: "不适用"}
+                │  └─ 租赁过期周期：${oneTime.rentalDetails?.rentalExpirationPeriod ?: "不适用"}
+                ├─ 有效时间窗口:
+                │  ├─ 开始时间：${
+                oneTime.validTimeWindow?.startTimeMillis?.let {
+                    java.util.Date(it).toString()
+                } ?: "无限制"
+            }
+                │  └─ 结束时间：${
+                oneTime.validTimeWindow?.endTimeMillis?.let {
+                    java.util.Date(it).toString()
+                } ?: "无限制"
+            }
+                └─ 购买选项 ID: ${oneTime.purchaseOptionId ?: "无"}
+                """.trimIndent()
+        )
     }
 
 
@@ -342,11 +450,11 @@ class GoogleBillingProvider(
                         .setIsOfferPersonalized(true)  //欧盟政策
                         .build()
                     val billingResult = billingClient.launchBillingFlow(activity, billingFlowParams)
-                    Log.d(TAG, "launchBillingFlow: 启动结果 $billingResult")
+                    LogUtil.d("launchBillingFlow: 启动结果 $billingResult")
                 }
 
                 else -> {
-                    Log.e(TAG, "launchBillingFlow: 匹配不到商品 ${response.code}")
+                    LogUtil.e("launchBillingFlow: 匹配不到商品 ${response.code}")
                     callback.onFailure(fromBillingResponseCode(response.code))
                 }
             }
@@ -363,6 +471,7 @@ class GoogleBillingProvider(
         billingClient.queryPurchasesAsync(
             QueryPurchasesParams.newBuilder()
                 .setProductType(billingProductType)
+                .includeSuspendedSubscriptions(true)//已暂停的订阅：订阅可能会在订阅生命周期内暂停。只有在 QueryPurchasesParams.Builder 上设置了 includeSuspendedSubscriptions 参数时，BillingClient.queryPurchasesAsync() 才会返回暂停的订阅。暂停的订阅不会在 PurchasesUpdatedListener 中返回
                 .build()
         ) { billingResult, purchases ->
             if (billingResult.responseCode == BillingResponseCode.OK) {
@@ -373,16 +482,19 @@ class GoogleBillingProvider(
                         Purchase.PurchaseState.PENDING -> PaymentPurchaseState.PENDING
                         else -> PaymentPurchaseState.UNSPECIFIED_STATE
                     }
-                    GooglePurchaseDetails(
+                    PaymentPurchaseDetails(
                         key = it.accountIdentifiers?.obfuscatedAccountId ?: "",
+                        orderId = it.orderId ?: "",
                         purchaseState = paymentPurchaseState,
                         products = it.products,
                         purchaseToken = it.purchaseToken,
                         isAcknowledged = it.isAcknowledged
                     )
                 }
+                LogUtil.d("获取订阅列表成功")
                 callback.onQuerySuccess(paymentPurchaseDetailsList)
             } else {
+                LogUtil.e("获取订阅列表失败")
                 callback.onQueryFailure(fromBillingResponseCode(billingResult.responseCode))
             }
         }
@@ -404,10 +516,10 @@ class GoogleBillingProvider(
         billingClient.acknowledgePurchase(params) { billingResult ->
             val response = BillingResponse(billingResult.responseCode)
             if (response.isOk) {
-                Log.i(TAG, "acknowledgePurchase：成功确认该商品 - token: $purchaseToken")
+                LogUtil.d("acknowledgePurchase：成功确认该商品 - token: $purchaseToken")
                 callback.invoke(true)
             } else {
-                Log.e(TAG, "acknowledgePurchase 失败：${billingResult.debugMessage}")
+                LogUtil.d("acknowledgePurchase 失败：${billingResult.debugMessage}")
                 callback.invoke(false)
             }
         }
@@ -429,14 +541,38 @@ class GoogleBillingProvider(
         billingClient.consumeAsync(consumeParams) { billingResult, purchaseToken ->
             val response = BillingResponse(billingResult.responseCode)
             if (response.isOk) {
-                Log.d(TAG, "consumeAsync: 成功消耗该商品 - token: $purchaseToken")
+                LogUtil.d("consumeAsync: 成功消耗该商品 - token: $purchaseToken")
                 callback.invoke(true)
             } else {
-                Log.e(TAG, "consumeAsync 失败：${billingResult.debugMessage}")
+                LogUtil.d("consumeAsync 失败：${billingResult.debugMessage}")
                 callback.invoke(false)
             }
         }
     }
+
+    /**
+     * 把结算库返回的购买详情映射为 PaymentPurchaseDetails
+     * **/
+    private fun mapToPaymentPurchaseDetails(purchase: Purchase): PaymentPurchaseDetails {
+        val paymentPurchaseState = when (purchase.purchaseState) {
+            Purchase.PurchaseState.PURCHASED -> PaymentPurchaseState.PURCHASED
+            Purchase.PurchaseState.PENDING -> PaymentPurchaseState.PENDING
+            else -> PaymentPurchaseState.UNSPECIFIED_STATE
+        }
+        return PaymentPurchaseDetails(
+            key = purchase.accountIdentifiers?.obfuscatedAccountId ?: "",
+            orderId = purchase.orderId ?: "",
+            purchaseState = paymentPurchaseState,
+            products = purchase.products,
+            purchaseToken = purchase.purchaseToken,
+            isAcknowledged = purchase.isAcknowledged
+        )
+    }
+
+    private fun mapToPaymentPurchaseList(purchases: List<Purchase>): List<PaymentPurchaseDetails> {
+        return purchases.map { mapToPaymentPurchaseDetails(it) }
+    }
+
 
     /**
      * 清理资源，防止内存泄露。
@@ -448,30 +584,10 @@ class GoogleBillingProvider(
             billingClient.endConnection()
         }
 
-        Log.d(TAG, "BillingClient cleaned up")
+        LogUtil.d("BillingClient cleaned up")
     }
 
-    /**
-     * 把结算库返回的购买详情映射为 PaymentPurchaseDetails
-     * **/
-    private fun mapToPaymentPurchaseDetails(purchase: Purchase): GooglePurchaseDetails {
-        val paymentPurchaseState = when (purchase.purchaseState) {
-            Purchase.PurchaseState.PURCHASED -> PaymentPurchaseState.PURCHASED
-            Purchase.PurchaseState.PENDING -> PaymentPurchaseState.PENDING
-            else -> PaymentPurchaseState.UNSPECIFIED_STATE
-        }
-        return GooglePurchaseDetails(
-            key = purchase.accountIdentifiers?.obfuscatedAccountId ?: "",
-            purchaseState = paymentPurchaseState,
-            products = purchase.products,
-            purchaseToken = purchase.purchaseToken,
-            isAcknowledged = purchase.isAcknowledged
-        )
-    }
 
-    private fun mapToPaymentPurchaseList(purchases: List<Purchase>): List<GooglePurchaseDetails> {
-        return purchases.map { mapToPaymentPurchaseDetails(it) }
-    }
 
     companion object {
         private const val TAG = "GoogleBillingProvider"

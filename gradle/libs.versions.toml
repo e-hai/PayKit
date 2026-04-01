@@ -8,10 +8,12 @@ kotlin = "2.3.20"
 # AndroidX Core
 core-ktx = "1.13.1"
 appcompat = "1.6.1"
-material = "1.10.0"
-constraintlayout = "2.1.4"
-activity = "1.8.0"
-fragment = "1.6.2"
+
+# Compose
+compose-bom = "2024.05.00"
+activity-compose = "1.9.0"
+lifecycle-runtime-compose = "2.8.0"
+splashscreen = "1.0.1"
 
 # Lifecycle
 lifecycle = "2.8.0"
@@ -34,9 +36,13 @@ espresso-core = "3.5.1"
 # AndroidX Core
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "core-ktx" }
 androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
-androidx-material = { group = "com.google.android.material", name = "material", version.ref = "material" }
-androidx-constraintlayout = { group = "androidx.constraintlayout", name = "constraintlayout", version.ref = "constraintlayout" }
-androidx-activity = { group = "androidx.activity", name = "activity", version.ref = "activity" }
+
+# Compose
+androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activity-compose" }
+androidx-lifecycle-runtime-compose = { group = "androidx.lifecycle", name = "lifecycle-runtime-compose", version.ref = "lifecycle-runtime-compose" }
+compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "compose-bom" }
+compose-material3 = { group = "androidx.compose.material3", name = "material3", version = "1.2.1" }
+androidx-core-splashscreen = { group = "androidx.core", name = "core-splashscreen", version.ref = "splashscreen" }
 
 # Lifecycle
 androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycle" }
@@ -52,9 +58,6 @@ androidx-collection-ktx = { group = "androidx.collection", name = "collection-kt
 billing = { group = "com.android.billingclient", name = "billing", version.ref = "billing" }
 billing-ktx = { group = "com.android.billingclient", name = "billing-ktx", version.ref = "billing" }
 
-# Fragment
-androidx-fragment-ktx = { group = "androidx.fragment", name = "fragment-ktx", version.ref = "fragment" }
-
 # Testing
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "androidx-test-ext" }
@@ -64,12 +67,12 @@ androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-co
 app = [
     "androidx-core-ktx",
     "androidx-appcompat",
-    "androidx-material",
-    "androidx-constraintlayout",
-    "androidx-activity",
-    "androidx-concurrent-futures-ktx",
+    "androidx-activity-compose",
+    "androidx-lifecycle-runtime-compose",
     "androidx-lifecycle-viewmodel-ktx",
-    "androidx-fragment-ktx"
+    "compose-bom",
+    "compose-material3",
+    "androidx-core-splashscreen"
 ]
 
 pay = [
@@ -85,3 +88,4 @@ pay = [
 android-application = { id = "com.android.application", version.ref = "agp" }
 android-library = { id = "com.android.library", version.ref = "agp" }
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }

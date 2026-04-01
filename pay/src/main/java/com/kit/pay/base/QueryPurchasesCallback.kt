@@ -8,9 +8,9 @@ interface QueryPurchasesCallback {
     /**
      * 当购买记录查询成功时调用。
      *
-     * @param products 包含查询结果的购买详情列表。
+     * @param purchases 包含查询结果的购买详情列表。
      */
-    fun onQuerySuccess(products: List<PaymentPurchaseDetails>)
+    fun onQuerySuccess(purchases: List<PaymentPurchaseDetails>)
 
     /**
      * 当购买记录查询失败时调用。

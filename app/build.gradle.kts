@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.compose.compiler)
 }
 
 android {
@@ -26,6 +27,10 @@ android {
         }
     }
     
+    buildFeatures {
+        compose = true
+    }
+    
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -41,4 +46,5 @@ android {
 dependencies {
     implementation(libs.bundles.app)
     implementation(project(":pay"))
+    
 }

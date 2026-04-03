@@ -1,19 +1,17 @@
 package com.kit.pay.base
 
 /**
- * 查询购买记录结果回调接口，用于通知购买记录查询的结果。
+ * 查询购买记录结果封装类
  */
-interface QueryPurchasesCallback {
+data class QueryPurchasesResult(
+    val purchases: List<PaymentPurchaseDetails> = emptyList(),
+    val errorCode: PaymentCode? = null
+)
 
-    /**
-     * 当购买记录查询成功时调用。
-     *
-     * @param purchases 包含查询结果的购买详情列表。
-     */
-    fun onQuerySuccess(purchases: List<PaymentPurchaseDetails>)
-
-    /**
-     * 当购买记录查询失败时调用。
-     */
-    fun onQueryFailure(errorCode: PaymentCode)
+/**
+ * 查询购买记录结果回调接口，用于通知购买记录查询的结果。
+ * 使用协程风格，通过 Result 类型返回结果
+ */
+fun interface QueryPurchasesCallback {
+    suspend operator fun invoke(): QueryPurchasesResult
 }

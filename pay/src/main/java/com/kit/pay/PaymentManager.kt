@@ -2,26 +2,32 @@ package com.kit.pay
 
 
 import android.app.Activity
+import java.lang.ref.WeakReference
 import com.kit.pay.base.InitializationCallback
-import com.kit.pay.base.MakePaymentCallback
+import com.kit.pay.base.MakePaymentResult
 import com.kit.pay.base.PaymentCallback
 import com.kit.pay.base.PaymentConfig
 import com.kit.pay.base.PaymentCode
-import com.kit.pay.base.PaymentProductDetails
 import com.kit.pay.base.PaymentProductType
 import com.kit.pay.base.PaymentProvider
 import com.kit.pay.base.PaymentPurchaseDetails
 import com.kit.pay.base.PaymentPurchaseState
 import com.kit.pay.base.PurchaseCallback
-import com.kit.pay.base.QueryProductsCallback
-import com.kit.pay.base.QueryPurchasesCallback
+import com.kit.pay.base.QueryProductsResult
+import com.kit.pay.base.QueryPurchasesResult
 import com.kit.pay.utils.LogUtil
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 
 /**
  * 管理支付逻辑的单例类。负责初始化支付提供者并处理支付、订阅状态查询、商品查询等操作。
  */
-class PaymentManager private constructor() {
+object PaymentManager {
 
 
     // 当前使用的支付提供者
@@ -40,14 +46,17 @@ class PaymentManager private constructor() {
     // 一次性可消耗商品库存（记录已购买但未消费的商品）
     private val consumableInventory = mutableSetOf<String>()
 
-    // 等待订单返回映射表：key -> PaymentCallback
-    private val waitingPayments = mutableMapOf<String, PaymentCallback>()
+    // 全局订单更新监听器
+    private var orderUpdateListener: PaymentCallback? = null
 
     // 是否已成功初始化支付提供者
     @Volatile
     private var isInitialized = false
 
     private var initCallback: InitializationCallback? = null
+
+    // 用于处理异步确认操作的协程作用域（使用 SupervisorJob 防止子协程失败影响父协程）
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /**
      * 获取商品配置（简化访问）
@@ -61,19 +70,22 @@ class PaymentManager private constructor() {
      *
      * @param provider 实现了 PaymentProvider 接口的支付提供者。
      * @param config 商品映射配置。
-     * @param callback 初始化结果回调。
+     * @param orderUpdateListener 全局订单更新监听器，所有订单的状态变化都会通过这个监听器通知。
+     * @param initCallback 初始化结果回调。
      */
     fun init(
         provider: PaymentProvider,
         config: PaymentConfig,
-        callback: InitializationCallback
+        orderUpdateListener: PaymentCallback,
+        initCallback: InitializationCallback
     ) {
         // 清理旧资源
         cleanup()
 
         this.paymentProvider = provider
         this.paymentConfig = config
-        this.initCallback = callback
+        this.orderUpdateListener = orderUpdateListener
+        this.initCallback = initCallback
 
         // 设置提供者的购买监听器，由提供者主动通知，时机不定，因为订单可在设备外部产生（网页，另一台设备同一个账号，推广链接）
         provider.setPurchaseListener(object : PurchaseCallback {
@@ -81,7 +93,9 @@ class PaymentManager private constructor() {
                 code: PaymentCode,
                 purchaseDetailList: List<PaymentPurchaseDetails>
             ) {
-                handleIncomingPurchase(code, purchaseDetailList)
+                scope.launch {
+                    handleIncomingPurchase(code, purchaseDetailList)
+                }
             }
         })
 
@@ -89,13 +103,13 @@ class PaymentManager private constructor() {
             override fun onSuccess() {
                 LogUtil.d("Payment provider initialized successfully")
                 isInitialized = true
-                callback.onSuccess()
+                initCallback.onSuccess()
             }
 
             override fun onFailure(errorCode: PaymentCode) {
                 LogUtil.e("Payment provider initialization failed: $errorCode")
                 isInitialized = false
-                callback.onFailure(errorCode)
+                initCallback.onFailure(errorCode)
             }
         })
     }
@@ -105,19 +119,15 @@ class PaymentManager private constructor() {
      * 查询商品信息并自动刷新本地缓存。
      *
      * @param productIds 商品 ID 列表。
-     * @param callback 查询结果回调。
+     * @return 查询结果。
      */
-    fun queryProducts(
-        productIds: List<String>,
-        callback: QueryProductsCallback
-    ) {
-        LogUtil.d("查询商品详情: ${productIds.size} 个商品")
+    suspend fun queryProducts(productIds: List<String>): QueryProductsResult {
+        LogUtil.d("查询商品详情：${productIds.size} 个商品")
         val provider = paymentProvider
         val config = paymentConfig
         if (!isInitialized || provider == null || config == null) {
             LogUtil.e("PaymentManager 未初始化，请先初始化")
-            callback.onQueryFailure(PaymentCode.SERVICE_UNAVAILABLE)
-            return
+            return QueryProductsResult(errorCode = PaymentCode.SERVICE_UNAVAILABLE)
         }
 
         // 映射商品 ID 到类型
@@ -125,58 +135,51 @@ class PaymentManager private constructor() {
             id to config.getProductType(id)
         }
 
-        provider.queryProducts(productsWithType, object : QueryProductsCallback {
-            override fun onQuerySuccess(
-                products: List<PaymentProductDetails>,
-                unfetchedProductIds: List<String>
-            ) {
-                callback.onQuerySuccess(products, unfetchedProductIds)
+        // 查询商品
+        return try {
+            withContext(Dispatchers.IO) {
+                provider.queryProducts(productsWithType)
             }
-
-            override fun onQueryFailure(errorCode: PaymentCode) {
-                callback.onQueryFailure(errorCode)
-            }
-        })
+        } catch (e: Exception) {
+            LogUtil.e("查询商品异常：${e.message}")
+            QueryProductsResult(errorCode = PaymentCode.ERROR)
+        }
     }
 
 
     /**
      * 查询所有的商品详情。
      */
-    fun queryAllProducts(callback: QueryProductsCallback) {
+    suspend fun queryAllProducts(): QueryProductsResult {
         val products = paymentConfig?.getAllProductIds() ?: run {
             LogUtil.e("配置中暂无商品")
-            callback.onQueryFailure(PaymentCode.SERVICE_UNAVAILABLE)
-            return
+            return QueryProductsResult(errorCode = PaymentCode.SERVICE_UNAVAILABLE)
         }
-        queryProducts(products, callback)
+        return queryProducts(products)
     }
 
-    fun querySubsProducts(callback: QueryProductsCallback) {
+    suspend fun querySubsProducts(): QueryProductsResult {
         val products = paymentConfig?.subsProducts ?: run {
             LogUtil.e("配置中暂无订阅商品")
-            callback.onQueryFailure(PaymentCode.SERVICE_UNAVAILABLE)
-            return
+            return QueryProductsResult(errorCode = PaymentCode.SERVICE_UNAVAILABLE)
         }
-        queryProducts(products, callback)
+        return queryProducts(products)
     }
 
-    fun queryConsumableProducts(callback: QueryProductsCallback) {
+    suspend fun queryConsumableProducts(): QueryProductsResult {
         val products = paymentConfig?.consumableProducts ?: run {
             LogUtil.e("配置中暂无一次性消耗商品")
-            callback.onQueryFailure(PaymentCode.SERVICE_UNAVAILABLE)
-            return
+            return QueryProductsResult(errorCode = PaymentCode.SERVICE_UNAVAILABLE)
         }
-        queryProducts(products, callback)
+        return queryProducts(products)
     }
 
-    fun queryNonConsumableProducts(callback: QueryProductsCallback) {
+    suspend fun queryNonConsumableProducts(): QueryProductsResult {
         val products = paymentConfig?.nonConsumableProducts ?: run {
             LogUtil.e("配置中暂无一次性非消耗商品")
-            callback.onQueryFailure(PaymentCode.SERVICE_UNAVAILABLE)
-            return
+            return QueryProductsResult(errorCode = PaymentCode.SERVICE_UNAVAILABLE)
         }
-        queryProducts(products, callback)
+        return queryProducts(products)
     }
 
     /**
@@ -189,32 +192,38 @@ class PaymentManager private constructor() {
      * - 检查订阅状态
      *
      * @param productType 商品类型（如订阅或一次性商品）。
-     * @param callback 查询结果回调。
+     * @return 查询结果。
      * @throws IllegalStateException 如果尚未初始化
      */
-    private fun queryPurchases(productType: PaymentProductType, callback: QueryPurchasesCallback) {
-        val provider = paymentProvider
-        if (!isInitialized || provider == null) {
-            LogUtil.e("PaymentManager not initialized, please call setPaymentProvider first")
-            callback.onQueryFailure(PaymentCode.SERVICE_UNAVAILABLE)
-            return
-        }
+    private suspend fun queryPurchases(productType: PaymentProductType): QueryPurchasesResult =
+        withContext(Dispatchers.IO) {
+            val provider = paymentProvider
+            if (!isInitialized || provider == null) {
+                LogUtil.e("PaymentManager not initialized, please call setPaymentProvider first")
+                return@withContext QueryPurchasesResult(errorCode = PaymentCode.SERVICE_UNAVAILABLE)
+            }
 
-        provider.queryPurchases(productType, callback)
-    }
+            // 查询订单
+            return@withContext try {
+                provider.queryPurchases(productType)
+            } catch (e: Exception) {
+                LogUtil.e("查询订单异常：${e.message}")
+                QueryPurchasesResult(errorCode = PaymentCode.ERROR)
+            }
+        }
 
     /**
      * 订阅订单查询。
      */
-    fun querySubsPurchases(callback: QueryPurchasesCallback) {
-        queryPurchases(PaymentProductType.SUBS, callback)
+    suspend fun querySubsPurchases(): QueryPurchasesResult {
+        return queryPurchases(PaymentProductType.SUBS)
     }
 
     /**
      * 一次性订单查询。
      */
-    fun queryInAppPurchases(callback: QueryPurchasesCallback) {
-        queryPurchases(PaymentProductType.INAPP, callback)
+    suspend fun queryInAppPurchases(): QueryPurchasesResult {
+        return queryPurchases(PaymentProductType.INAPP)
     }
 
 
@@ -269,10 +278,10 @@ class PaymentManager private constructor() {
      * 触发时机：支付平台主动通知购买状态更新
      * 特点：
      * - SDK 自动处理确认和权益发放
-     * - 关联 waitingPayments 中的回调
+     * - 通过全局 orderUpdateListener 通知开发者
      * - 对开发者透明，无需手动操作
      */
-    private fun handleIncomingPurchase(
+    private suspend fun handleIncomingPurchase(
         code: PaymentCode,
         purchaseDetailList: List<PaymentPurchaseDetails>
     ) {
@@ -285,118 +294,99 @@ class PaymentManager private constructor() {
             PaymentCode.OK -> {
                 LogUtil.d("生成订单成功=${purchaseDetailList.size}")
                 purchaseDetailList.forEach { purchase ->
-                    if (purchase.purchaseState == PaymentPurchaseState.PURCHASED) {
-                        val config = getPaymentConfig()
-                        val productId = purchase.products.first()
-                        val isConsumable = config.isConsumable(productId)
-                        val isNonConsumable = config.isNonConsumable(productId)
-                        val isSubs = config.isSubs(productId)
+                    when (purchase.purchaseState) {
+                        PaymentPurchaseState.PURCHASED -> {
+                            val config = getPaymentConfig()
+                            val productId = purchase.products.first()
+                            val isConsumable = config.isConsumable(productId)
+                            val isNonConsumable = config.isNonConsumable(productId)
+                            val isSubs = config.isSubs(productId)
 
-                        when {
-                            // 订阅商品
-                            isSubs -> {
-                                if (purchase.isAcknowledged) {
-                                    LogUtil.d("订阅商品已确认，激活权益：$productId")
-                                    subsEntitlements.add(productId)
-                                    synchronized(waitingPayments) {
-                                        waitingPayments.remove(purchase.key)
-                                            ?.onSuccess(purchase)
-                                    }
-                                } else {
-                                    LogUtil.d("订阅商品未确认，开始确认：$productId")
-                                    provider.acknowledgePurchase(purchase.purchaseToken) { isSuccess ->
-                                        if (isSuccess) {
+                            when {
+                                // 订阅商品
+                                isSubs -> {
+                                    if (purchase.isAcknowledged) {
+                                        LogUtil.d("订阅商品已确认，激活权益：$productId")
+                                        subsEntitlements.add(productId)
+                                        // 通知全局监听器
+                                        orderUpdateListener?.onSuccess(purchase)
+                                    } else {
+                                        LogUtil.d("订阅商品未确认，开始确认：$productId")
+                                        val ackResult =
+                                            provider.acknowledgePurchase(purchase.purchaseToken)
+                                        if (ackResult.isSuccess) {
                                             LogUtil.d("订阅商品确认成功，激活权益：$productId")
                                             subsEntitlements.add(productId)
-                                            synchronized(waitingPayments) {
-                                                waitingPayments.remove(purchase.key)
-                                                    ?.onSuccess(purchase)
-                                            }
+                                            // 通知全局监听器
+                                            orderUpdateListener?.onSuccess(purchase)
                                         } else {
                                             LogUtil.e("订阅商品确认失败：$productId")
-                                            // 通知回调：支付成功但确认失败
-                                            synchronized(waitingPayments) {
-                                                waitingPayments.remove(purchase.key)
-                                                    ?.onConfirmFailed(purchase)
-                                            }
+                                            // 通知全局监听器：支付成功但确认失败
+                                            orderUpdateListener?.onConfirmFailed(purchase)
                                         }
                                     }
                                 }
-                            }
 
-                            // 非消耗商品（永久有效）
-                            isNonConsumable -> {
-                                if (purchase.isAcknowledged) {
-                                    LogUtil.d("非消耗商品已确认，激活永久权益：$productId")
-                                    nonConsumableEntitlements.add(productId)
-                                    synchronized(waitingPayments) {
-                                        waitingPayments.remove(purchase.key)
-                                            ?.onSuccess(purchase)
-                                    }
-                                } else {
-                                    LogUtil.d("非消耗商品未确认，开始确认：$productId")
-                                    provider.acknowledgePurchase(purchase.purchaseToken) { isSuccess ->
-                                        if (isSuccess) {
+                                // 非消耗商品（永久有效）
+                                isNonConsumable -> {
+                                    if (purchase.isAcknowledged) {
+                                        LogUtil.d("非消耗商品已确认，激活永久权益：$productId")
+                                        nonConsumableEntitlements.add(productId)
+                                        // 通知全局监听器
+                                        orderUpdateListener?.onSuccess(purchase)
+                                    } else {
+                                        LogUtil.d("非消耗商品未确认，开始确认：$productId")
+                                        val ackResult =
+                                            provider.acknowledgePurchase(purchase.purchaseToken)
+                                        if (ackResult.isSuccess) {
                                             LogUtil.d("非消耗商品确认成功，激活永久权益：$productId")
                                             nonConsumableEntitlements.add(productId)
-                                            synchronized(waitingPayments) {
-                                                waitingPayments.remove(purchase.key)
-                                                    ?.onSuccess(purchase)
-                                            }
+                                            // 通知全局监听器
+                                            orderUpdateListener?.onSuccess(purchase)
                                         } else {
                                             LogUtil.e("非消耗商品确认失败：$productId")
-                                            // 通知回调：支付成功但确认失败
-                                            synchronized(waitingPayments) {
-                                                waitingPayments.remove(purchase.key)
-                                                    ?.onConfirmFailed(purchase)
-                                            }
+                                            // 通知全局监听器：支付成功但确认失败
+                                            orderUpdateListener?.onConfirmFailed(purchase)
                                         }
                                     }
                                 }
-                            }
 
-                            // 可消耗商品（添加到库存，等待消费）
-                            isConsumable -> {
-                                if (purchase.isAcknowledged) {
-                                    LogUtil.d("可消耗商品已确认，添加到库存：$productId")
-                                    consumableInventory.add(productId)
-                                    synchronized(waitingPayments) {
-                                        waitingPayments.remove(purchase.key)
-                                            ?.onSuccess(purchase)
-                                    }
-                                }else{
-                                    LogUtil.d("可消耗商品未确认，开始确认：$productId")
-                                    provider.acknowledgePurchase(purchase.purchaseToken) { isSuccess ->
-                                        if (isSuccess) {
+                                // 可消耗商品（添加到库存，等待消费）
+                                isConsumable -> {
+                                    if (purchase.isAcknowledged) {
+                                        LogUtil.d("可消耗商品已确认，添加到库存：$productId")
+                                        consumableInventory.add(productId)
+                                        // 通知全局监听器
+                                        orderUpdateListener?.onSuccess(purchase)
+                                    } else {
+                                        LogUtil.d("可消耗商品未确认，开始确认：$productId")
+                                        val ackResult =
+                                            provider.acknowledgePurchase(purchase.purchaseToken)
+                                        if (ackResult.isSuccess) {
                                             LogUtil.d("可消耗商品确认成功，添加到库存：$productId")
                                             consumableInventory.add(productId)
-                                            synchronized(waitingPayments) {
-                                                waitingPayments.remove(purchase.key)
-                                                    ?.onSuccess(purchase)
-                                            }
+                                            // 通知全局监听器
+                                            orderUpdateListener?.onSuccess(purchase)
                                         } else {
                                             LogUtil.e("可消耗商品确认失败：$productId")
-                                            // 通知回调：支付成功但确认失败
-                                            synchronized(waitingPayments) {
-                                                waitingPayments.remove(purchase.key)
-                                                    ?.onConfirmFailed(purchase)
-                                            }
+                                            // 通知全局监听器：支付成功但确认失败
+                                            orderUpdateListener?.onConfirmFailed(purchase)
                                         }
                                     }
                                 }
                             }
+
                         }
 
-                    } else if (purchase.purchaseState == PaymentPurchaseState.PENDING) {
-                        LogUtil.d("线下、信用卡等延迟支付，即用户已经付款，但是这些渠道还没把钱转到 google play billing 等订阅平台，需提示用户正在等待打款成功")
-                        // 通知回调：支付待处理
-                        synchronized(waitingPayments) {
-                            waitingPayments.remove(purchase.key)?.onPending(purchase)
+                        PaymentPurchaseState.PENDING -> {
+                            LogUtil.d("线下、信用卡等延迟支付，即用户已经付款，但是这些渠道还没把钱转到 google play billing 等订阅平台，需提示用户正在等待打款成功")
+                            // 通知全局监听器：支付待处理
+                            orderUpdateListener?.onPending(purchase)
                         }
-                    } else {
-                        LogUtil.d("订单的购买状态未明或在某些测试场景下状态无效，可以记录并忽略，极少出现")
-                        synchronized(waitingPayments) {
-                            waitingPayments.remove(purchase.key)?.onFailure(PaymentCode.ERROR)
+
+                        else -> {
+                            LogUtil.d("订单的购买状态未明或在某些测试场景下状态无效，可以记录并忽略，极少出现")
+                            orderUpdateListener?.onFailure(PaymentCode.ERROR, purchase)
                         }
                     }
                 }
@@ -405,18 +395,17 @@ class PaymentManager private constructor() {
             PaymentCode.USER_CANCELED -> {
                 LogUtil.d("用户取消了支付")
                 purchaseDetailList.forEach { purchase ->
-                    synchronized(waitingPayments) {
-                        waitingPayments.remove(purchase.key)?.onUserCancel()
-                    }
+                    // 通知全局监听器
+                    orderUpdateListener?.onUserCancel(purchase)
                 }
             }
 
             else -> {
-                LogUtil.e("网络错误等等问题导致支付失败：$code")
+                LogUtil.e("网络错误等等问题导致支付失败：$code ${purchaseDetailList.size}")
                 purchaseDetailList.forEach { purchase ->
-                    synchronized(waitingPayments) {
-                        waitingPayments.remove(purchase.key)?.onFailure(code)
-                    }
+                    // 通知全局监听器
+                    LogUtil.e("支付失败：${purchase}")
+                    orderUpdateListener?.onFailure(code, purchase)
                 }
             }
         }
@@ -426,59 +415,38 @@ class PaymentManager private constructor() {
     /**
      * 发起支付请求。为了保证支付流程的简洁，一种类型的商品对应一个订单
      *
-     * @param activity 用于支付流程的 Activity。
-     * @param key 标识符
+     * @param activity 用于支付流程的 Activity（会使用弱引用，防止内存泄漏）。
+     * @param key 标识符，用于区分不同订单
      * @param productId 商品 ID。
      * @param offerId 优惠方案 ID。
-     * @param callback 支付结果回调。
+     * @return 发起支付结果。
      */
-    fun makePayment(
+    suspend fun makePayment(
         activity: Activity,
         key: String,
         productId: String,
-        offerId: String,
-        callback: PaymentCallback
-    ) {
+        offerId: String
+    ): MakePaymentResult {
         val provider = paymentProvider
         val config = paymentConfig
         if (!isInitialized || provider == null || config == null) {
             LogUtil.e("PaymentManager not initialized, please call init first")
-            callback.onFailure(PaymentCode.SERVICE_UNAVAILABLE)
-            return
+            return MakePaymentResult(isSuccess = false, errorCode = PaymentCode.SERVICE_UNAVAILABLE)
         }
 
         // 自动识别商品类型
         val productType = config.getProductType(productId)
 
-        // 将回调存入待处理队列
-        synchronized(waitingPayments) {
-            waitingPayments[key] = callback
-        }
-
+        // 使用弱引用传递 Activity，防止内存泄漏
+        val weakActivity = WeakReference(activity)
         // 发起支付请求
-        provider.makePayment(
-            activity, key, productType, productId, offerId,
-            object : MakePaymentCallback {
-                override fun onSuccess() {
-                    // 底层拉起支付流程成功（ launchBillingFlow 返回 OK ），但真正的购买结果通过 handleIncomingPurchase 异步返回
-                    LogUtil.d("支付平台，拉起成功: $key")
-                }
-
-                override fun onFailure(errorCode: PaymentCode) {
-                    // 底层拉起支付流程失败
-                    LogUtil.e("支付平台，拉起失败: $key, error: $errorCode")
-                    synchronized(waitingPayments) {
-                        waitingPayments.remove(key)
-                    }
-                    callback.onFailure(errorCode)
-                }
-            })
-    }
-
-    fun removePaymentCallback(key: String) {
-        synchronized(waitingPayments) {
-            waitingPayments.remove(key)
+        val result = provider.makePayment(weakActivity, key, productType, productId, offerId)
+        if (result.isSuccess) {
+            LogUtil.d("发起支付成功，等待支付结果确认")
+        } else {
+            LogUtil.e("发起支付失败：${result.errorCode}")
         }
+        return result
     }
 
 
@@ -488,147 +456,113 @@ class PaymentManager private constructor() {
      *
      * @param productType 商品类型。
      * @param onOrderRecovered 业务层回调，仅用于通知哪些商品被恢复了（每个订单确认成功后触发）。
-     * @param onComplete 所有订单恢复完成后的回调（所有确认操作都已完成）。
      */
-    fun recoverUnfinishedOrders(
+    suspend fun recoverUnfinishedOrders(
         productType: PaymentProductType,
-        onOrderRecovered: (purchase: PaymentPurchaseDetails) -> Unit = {},
-        onComplete: () -> Unit = {}
-    ) {
+        onOrderRecovered: (purchase: PaymentPurchaseDetails) -> Unit = {}
+    ) = withContext(Dispatchers.IO) {
         val provider = paymentProvider
         if (!isInitialized || provider == null) {
-            LogUtil.e("PaymentManager not initialized, please call init first")
-            onComplete()
-            return
+            LogUtil.e("PaymentManager not initialized, please call init first <ProduceType:$productType>")
+            return@withContext
         }
 
-        provider.queryPurchases(productType, object : QueryPurchasesCallback {
-            override fun onQuerySuccess(purchases: List<PaymentPurchaseDetails>) {
-                if (purchases.isEmpty()) {
-                    onComplete()
-                    return
-                }
+        // 恢复订单
+        val result = try {
+            provider.queryPurchases(productType)
+        } catch (e: Exception) {
+            LogUtil.e("$productType 恢复订单失败：${e.message}")
+            return@withContext
+        }
 
-                // 统计需要处理的订单数量
-                var processedCount = 0
-                val totalToProcess = purchases.size
+        val purchases = result.purchases
+        if (purchases.isEmpty()) {
+            LogUtil.d("$productType 恢复订单成功，无未完成订单")
+            return@withContext
+        }
 
-                // 遍历所有订单进行处理
-                purchases.forEach { purchase ->
-                    if (purchase.purchaseState == PaymentPurchaseState.PURCHASED) {
-                        val productId = purchase.products.first()
-                        val config = getPaymentConfig()
+        // 遍历所有订单进行处理
+        purchases.forEach { purchase ->
+            when (purchase.purchaseState) {
+                PaymentPurchaseState.PURCHASED -> {
+                    val productId = purchase.products.first()
+                    val config = getPaymentConfig()
 
-                        when {
-                            // 订阅商品：需要检查确认状态
-                            config.isSubs(productId) -> {
-                                if (purchase.isAcknowledged) {
-                                    LogUtil.d("恢复订阅 - 已确认，激活权益：$productId")
+                    when {
+                        // 订阅商品：需要检查确认状态
+                        config.isSubs(productId) -> {
+                            if (purchase.isAcknowledged) {
+                                LogUtil.d("恢复订阅 - 已确认，激活权益：$productId")
+                                subsEntitlements.addAll(purchase.products)
+                                onOrderRecovered(purchase)
+                            } else {
+                                LogUtil.d("恢复订阅 - 未确认，开始确认：$productId")
+                                val ackResult = provider.acknowledgePurchase(purchase.purchaseToken)
+                                if (ackResult.isSuccess) {
+                                    LogUtil.d("恢复订阅 - 确认成功，激活权益：$productId")
                                     subsEntitlements.addAll(purchase.products)
                                     onOrderRecovered(purchase)
-                                    processedCount++
                                 } else {
-                                    LogUtil.d("恢复订阅 - 未确认，开始确认：$productId")
-                                    provider.acknowledgePurchase(purchase.purchaseToken) { isSuccess ->
-                                        if (isSuccess) {
-                                            LogUtil.d("恢复订阅 - 确认成功，激活权益：$productId")
-                                            subsEntitlements.addAll(purchase.products)
-                                            onOrderRecovered(purchase)
-                                        } else {
-                                            LogUtil.e("恢复订阅 - 确认失败：$productId")
-                                        }
-                                        processedCount++
-                                        if (processedCount >= totalToProcess) {
-                                            LogUtil.d("恢复订单 - 全部完成，共处理 ${purchases.size} 个订单")
-                                            onComplete()
-                                        }
-                                    }
+                                    LogUtil.e("恢复订阅 - 确认失败：$productId")
                                 }
                             }
+                        }
 
-                            // 非消耗商品（永久）：需要检查确认状态
-                            config.isNonConsumable(productId) -> {
-                                if (purchase.isAcknowledged) {
-                                    LogUtil.d("恢复非消耗商品 - 已确认，激活永久权益：$productId")
+                        // 非消耗商品（永久）：需要检查确认状态
+                        config.isNonConsumable(productId) -> {
+                            if (purchase.isAcknowledged) {
+                                LogUtil.d("恢复非消耗商品 - 已确认，激活永久权益：$productId")
+                                nonConsumableEntitlements.addAll(purchase.products)
+                                onOrderRecovered(purchase)
+
+                            } else {
+                                LogUtil.d("恢复非消耗商品 - 未确认，开始确认：$productId")
+                                val ackResult = provider.acknowledgePurchase(purchase.purchaseToken)
+                                if (ackResult.isSuccess) {
+                                    LogUtil.d("恢复非消耗商品 - 确认成功，激活永久权益：$productId")
                                     nonConsumableEntitlements.addAll(purchase.products)
                                     onOrderRecovered(purchase)
-                                    processedCount++
-
                                 } else {
-                                    LogUtil.d("恢复非消耗商品 - 未确认，开始确认：$productId")
-                                    provider.acknowledgePurchase(purchase.purchaseToken) { isSuccess ->
-                                        if (isSuccess) {
-                                            LogUtil.d("恢复非消耗商品 - 确认成功，激活永久权益：$productId")
-                                            nonConsumableEntitlements.addAll(purchase.products)
-                                            onOrderRecovered(purchase)
-                                        } else {
-                                            LogUtil.e("恢复非消耗商品 - 确认失败：$productId")
-                                        }
-                                        processedCount++
-                                        if (processedCount >= totalToProcess) {
-                                            LogUtil.d("恢复订单 - 全部完成，共处理 ${purchases.size} 个订单")
-                                            onComplete()
-                                        }
-                                    }
+                                    LogUtil.e("恢复非消耗商品 - 确认失败：$productId")
                                 }
                             }
+                        }
 
-                            // 可消耗商品：确认后会被消费，不会出现在订单中
-                            // 能查询到说明还未消费，直接添加到库存
-                            config.isConsumable(productId) -> {
-                                if (purchase.isAcknowledged){
-                                    LogUtil.d("恢复可消耗商品 - 已确认，添加到库存：$productId")
+                        // 可消耗商品：确认后会被消费，不会出现在订单中
+                        // 能查询到说明还未消费，直接添加到库存
+                        config.isConsumable(productId) -> {
+                            if (purchase.isAcknowledged) {
+                                LogUtil.d("恢复可消耗商品 - 已确认，添加到库存：$productId")
+                                consumableInventory.addAll(purchase.products)
+                                onOrderRecovered(purchase)
+                            } else {
+                                LogUtil.d("恢复可消耗商品 - 未消费，添加到库存：$productId")
+                                val consumeResult = provider.consumePurchase(purchase.purchaseToken)
+                                if (consumeResult.isSuccess) {
+                                    LogUtil.d("恢复可消耗商品 - 消费成功，添加到库存：$productId")
                                     consumableInventory.addAll(purchase.products)
                                     onOrderRecovered(purchase)
-                                    processedCount++
-                                }else{
-                                    LogUtil.d("恢复可消耗商品 - 未消费，添加到库存：$productId")
-                                    provider.consumePurchase(purchase.purchaseToken){isSuccess ->
-                                        if (isSuccess) {
-                                            LogUtil.d("恢复可消耗商品 - 消费成功，添加到库存：$productId")
-                                            consumableInventory.addAll(purchase.products)
-                                            onOrderRecovered(purchase)
-                                        } else {
-                                            LogUtil.e("恢复可消耗商品 - 消费失败：$productId")
-                                        }
-                                        processedCount++
-                                        if (processedCount >= totalToProcess) {
-                                            LogUtil.d("恢复订单 - 全部完成，共处理 ${purchases.size} 个订单")
-                                            onComplete()
-                                        }
-                                    }
+                                } else {
+                                    LogUtil.e("恢复可消耗商品 - 消费失败：$productId")
                                 }
                             }
                         }
-                    } else if (purchase.purchaseState == PaymentPurchaseState.PENDING) {
-                        // PENDING 状态的订单，暂时不处理，等待后续支付平台通知
-                        LogUtil.d("恢复订单 - 待处理状态，跳过：${purchase.products.first()}")
-                        processedCount++
-                        if (processedCount >= totalToProcess) {
-                            onComplete()
-                        }
-                    } else {
-                        // 其他无效状态，跳过
-                        LogUtil.d("恢复订单 - 无效状态，跳过：${purchase.products.first()}")
-                        processedCount++
-                        if (processedCount >= totalToProcess) {
-                            onComplete()
-                        }
-                    }
-
-                    // 检查是否所有订单都处理完成
-                    if (processedCount >= totalToProcess) {
-                        LogUtil.d("恢复订单 - 全部完成，共处理 ${purchases.size} 个订单")
-                        onComplete()
                     }
                 }
-            }
 
-            override fun onQueryFailure(errorCode: PaymentCode) {
-                LogUtil.e("恢复订单失败：$errorCode")
-                onComplete()
+                PaymentPurchaseState.PENDING -> {
+                    // PENDING 状态的订单，暂时不处理，等待后续支付平台通知
+                    LogUtil.d("恢复订单 - 待处理状态，跳过：${purchase.products.first()}")
+                }
+
+                else -> {
+                    // 其他无效状态，跳过
+                    LogUtil.d("恢复订单 - 无效状态，跳过：${purchase.products.first()}")
+                }
             }
-        })
+        }
+
+        LogUtil.d("$productType 恢复订单 - 全部完成，共处理 ${purchases.size} 个订单")
     }
 
     /**
@@ -636,6 +570,15 @@ class PaymentManager private constructor() {
      * 在应用退出或不再需要支付功能时调用（如 Application.onTerminate 或 MainActivity.onDestroy）。
      */
     fun cleanup() {
+        if (!isInitialized) return
+
+        // 取消所有正在进行的异步操作
+        val scopeRef = scope
+        val job = scopeRef.coroutineContext[Job]
+        if (job != null && !job.isCompleted) {
+            job.cancel()
+        }
+
         // 清理缓存和状态
         subsEntitlements.clear()
         nonConsumableEntitlements.clear()
@@ -646,26 +589,13 @@ class PaymentManager private constructor() {
         paymentProvider = null
         isInitialized = false
 
+        // 清理全局监听器
+        orderUpdateListener = null
+
         LogUtil.d("PaymentManager cleaned up")
     }
 
-    companion object {
-        const val TAG = "PaymentManager"
 
-        // 单例实例，使用 @Volatile 保证线程安全
-        @Volatile
-        private var INSTANCE: PaymentManager? = null
-
-        /**
-         * 获取 PaymentManager 单例实例。
-         *
-         * @return PaymentManager 实例。
-         */
-        fun getInstance(): PaymentManager =
-            INSTANCE ?: synchronized(this) {
-                INSTANCE ?: PaymentManager().also { INSTANCE = it }
-            }
-    }
 }
 
 

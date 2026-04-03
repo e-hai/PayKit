@@ -9,7 +9,7 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.kit.pay.sample"
+        applicationId = "com.google.play.billing.samples.onetimepurchases"
         minSdk = 23
         versionCode = 1
         versionName = "1.0"

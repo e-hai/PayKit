@@ -1,8 +1,9 @@
 package com.kit.pay.base
 
-interface MakePaymentCallback {
-
-    fun onSuccess()
-
-    fun onFailure(errorCode: PaymentCode)
-}
+/**
+ * 发起支付结果封装类
+ */
+data class MakePaymentResult(
+    val isSuccess: Boolean,
+    val errorCode: PaymentCode? = null
+)

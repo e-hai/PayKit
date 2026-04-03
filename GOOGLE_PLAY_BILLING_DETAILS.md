@@ -16,11 +16,7 @@
   - [2.2 订单状态](#22-订单状态)
   - [2.3 用户账户信息](#23-用户账户信息)
   - [2.4 完整示例](#24-完整示例)
-- [三、实际应用场景](#三实际应用场景)
-  - [场景 1：查询商品并展示](#场景 1 查询商品并展示)
-  - [场景 2：发起订阅购买](#场景 2 发起订阅购买)
-  - [场景 3：处理支付回调](#场景 3 处理支付回调)
-  - [场景 4：恢复未完成订单](#场景 4 恢复未完成订单)
+- [三、关键要点总结](#三关键要点总结)
 
 ---
 
@@ -345,172 +341,7 @@ Purchase(
 
 ---
 
-## 三、实际应用场景
-
-### 场景 1：查询商品并展示
-
-```kotlin
-// 查询商品详情
-PaymentManager.getInstance().queryProducts(
-    productIds = listOf("premium_monthly", "premium_yearly"),
-    callback = object : QueryProductsCallback {
-        override fun onQuerySuccess(
-            products: List<PaymentProductDetails>,
-            unfetchedProductIds: List<String>
-        ) {
-            products.forEach { product ->
-                Log.d(TAG, "商品：${product.title}")
-                Log.d(TAG, "类型：${product.productType}")
-                Log.d(TAG, "描述：${product.description}")
-                
-                // 根据商品类型展示不同信息
-                when (product.productType) {
-                    PaymentProductType.SUBS -> {
-                        // 订阅商品：显示价格周期
-                        Log.d(TAG, "订阅商品：${product.title}")
-                        // TODO: 从 subscriptionOfferDetails 获取价格信息
-                    }
-                    PaymentProductType.INAPP -> {
-                        // 一次性商品：显示固定价格
-                        Log.d(TAG, "一次性商品：${product.title}")
-                        // TODO: 从 oneTimePurchaseOfferDetails 获取价格信息
-                    }
-                }
-            }
-        }
-        
-        override fun onQueryFailure(errorCode: PaymentCode) {
-            Log.e(TAG, "查询失败：$errorCode")
-        }
-    }
-)
-```
-
----
-
-### 场景 2：发起订阅购买
-
-```kotlin
-@OptIn(ExperimentalUuidApi::class)
-fun purchaseSubs(activity: Activity) {
-    PaymentManager.getInstance().makePayment(
-        activity = activity,
-        key = Uuid.generateV4().toHexString(),  // 订单标识
-        productId = "premium_monthly",
-        offerId = "basicmonthly",               // 基础方案
-        callback = object : PaymentCallback {
-            override fun onSuccess(purchaseDetails: PaymentPurchaseDetails) {
-                Log.d(TAG, "支付成功 - 订单号：${purchaseDetails.orderId}")
-                Log.d(TAG, "商品：${purchaseDetails.products}")
-                Log.d(TAG, "是否已确认：${purchaseDetails.isAcknowledged}")
-                
-                // 立即发放权益
-                grantVipEntitlement()
-            }
-            
-            override fun onConfirmFailed(purchaseDetails: PaymentPurchaseDetails) {
-                Log.e(TAG, "支付成功但确认失败")
-                // SDK 会在后台继续尝试确认
-            }
-            
-            override fun onFailure(errorCode: PaymentCode) {
-                Log.e(TAG, "支付失败：$errorCode")
-            }
-        }
-    )
-}
-```
-
----
-
-### 场景 3：处理支付回调
-
-```kotlin
-// 在 GoogleBillingProvider 中设置监听器
-billingClient.setListener { billingResult, purchases ->
-    if (billingResult.responseCode == BillingResponseCode.OK) {
-        purchases?.forEach { purchase ->
-            when (purchase.purchaseState) {
-                Purchase.PurchaseState.PURCHASED -> {
-                    // 已支付成功
-                    handleSuccessfulPurchase(purchase)
-                }
-                Purchase.PurchaseState.PENDING -> {
-                    // 待处理（延迟支付）
-                    handlePendingPurchase(purchase)
-                }
-            }
-        }
-    }
-}
-
-private fun handleSuccessfulPurchase(purchase: Purchase) {
-    Log.d(TAG, "订单 ID: ${purchase.orderId}")
-    Log.d(TAG, "商品：${purchase.products}")
-    Log.d(TAG, "购买时间：${Date(purchase.purchaseTime)}")
-    Log.d(TAG, "是否已确认：${purchase.isAcknowledged}")
-    Log.d(TAG, "用户 ID: ${purchase.accountIdentifiers?.obfuscatedAccountId}")
-    
-    // 检查是否需要确认
-    if (!purchase.isAcknowledged) {
-        // 调用 acknowledgePurchase 确认订单
-        confirmPurchase(purchase.purchaseToken)
-    } else {
-        // 已确认，直接发放权益
-        grantEntitlement(purchase)
-    }
-}
-```
-
----
-
-### 场景 4：恢复未完成订单
-
-```kotlin
-fun recoverUnfinishedOrders() {
-    // 恢复订阅订单
-    PaymentManager.getInstance().recoverUnfinishedOrders(
-        productType = PaymentProductType.SUBS,
-        onOrderRecovered = { purchase ->
-            Log.d(TAG, "恢复订阅订单：${purchase.orderId}")
-            Log.d(TAG, "商品：${purchase.products}")
-            Log.d(TAG, "是否已确认：${purchase.isAcknowledged}")
-            
-            // 如果已确认，直接激活权益
-            if (purchase.isAcknowledged) {
-                activateSubscription(purchase)
-            }
-        },
-        onComplete = {
-            Log.d(TAG, "订单恢复完成")
-            checkVipStatus()
-        }
-    )
-    
-    // 恢复一次性商品订单
-    PaymentManager.getInstance().recoverUnfinishedOrders(
-        productType = PaymentProductType.INAPP,
-        onOrderRecovered = { purchase ->
-            Log.d(TAG, "恢复一次性商品：${purchase.orderId}")
-            
-            // 消耗商品：如果还未消费，添加到库存
-            if (isConsumable(purchase.products.first())) {
-                addToInventory(purchase)
-            } else {
-                // 非消耗商品：激活永久权益
-                activatePermanentEntitlement(purchase)
-            }
-        },
-        onComplete = {
-            Log.d(TAG, "一次性商品恢复完成")
-        }
-    )
-}
-```
-
----
-
-## 四、关键要点总结
+## 三、关键要点总结
 
 ### ✅ 商品详情关键点
 
@@ -546,7 +377,7 @@ fun recoverUnfinishedOrders() {
 
 ---
 
-## 五、常见问题
+## 四、常见问题
 
 ### Q1: 为什么查询到的商品没有价格信息？
 **A:** 可能原因：
@@ -574,5 +405,6 @@ fun recoverUnfinishedOrders() {
 
 ---
 
-**文档版本**: v1.0  
+**文档版本**: v1.1  
 **适用版本**: Google Play Billing Library 8.3.0+
+**最后更新**: 2026-04-03

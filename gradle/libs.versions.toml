@@ -16,7 +16,7 @@ lifecycle-runtime-compose = "2.8.0"
 splashscreen = "1.0.1"
 
 # Lifecycle
-lifecycle = "2.8.0"
+lifecycle = "2.10.0"
 
 # Concurrent Futures
 concurrent-futures = "1.3.0"
@@ -47,6 +47,7 @@ androidx-core-splashscreen = { group = "androidx.core", name = "core-splashscree
 # Lifecycle
 androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycle" }
 androidx-lifecycle-viewmodel-ktx = { group = "androidx.lifecycle", name = "lifecycle-viewmodel-ktx", version.ref = "lifecycle" }
+androidx-lifecycle-process = { group = "androidx.lifecycle", name = "lifecycle-process", version.ref = "lifecycle" }
 
 # Concurrent Futures
 androidx-concurrent-futures-ktx = { group = "androidx.concurrent", name = "concurrent-futures-ktx", version.ref = "concurrent-futures" }
@@ -80,6 +81,7 @@ pay = [
     "androidx-lifecycle-runtime-ktx",
     "androidx-concurrent-futures-ktx",
     "androidx-collection-ktx",
+    "androidx-lifecycle-process",
     "billing",
     "billing-ktx"
 ]

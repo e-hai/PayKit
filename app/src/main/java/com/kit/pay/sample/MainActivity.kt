@@ -1,5 +1,6 @@
 package com.kit.pay.sample
 
+import android.app.Activity
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -29,11 +30,12 @@ import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
-import com.kit.pay.base.PaymentProductDetails
-import com.kit.pay.base.PaymentProductType
+import com.kit.pay.models.ProductType
+import com.kit.pay.models.StoreProduct
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import java.lang.ref.WeakReference
 
 /**
  * 主 Activity（使用 Compose 实现所有页面）
@@ -85,7 +87,7 @@ class MainActivity : ComponentActivity() {
                     // 收集 ViewModel 中的 UI 状态
                     val uiState by mainViewModel.uiState.collectAsState()
                     val productList by mainViewModel.productList.collectAsState()
-                    val selectedProduct by mainViewModel.selectedProduct.collectAsState()
+                    // UI state collectors
                     val subsProducts by mainViewModel.subsProducts.collectAsState()
                     val consumableProducts by mainViewModel.consumableProducts.collectAsState()
                     val nonConsumableProducts by mainViewModel.nonConsumableProducts.collectAsState()
@@ -99,12 +101,12 @@ class MainActivity : ComponentActivity() {
                             nonConsumableProducts = nonConsumableProducts,
                             onPurchaseClick = { productId, offerId ->
                                 // 直接调用购买函数，传入当前 Activity
-                                mainViewModel.purchaseProduct(this@MainActivity, productId, offerId)
+                                mainViewModel.purchaseProduct(WeakReference(this@MainActivity as Activity), productId, offerId)
                             },
                             onFeatureClick = { action ->
                                 // 根据 action 直接调用对应函数
                                 when (action) {
-                                    "query_products" -> mainViewModel.queryProductsWithToast()
+                                    "query_products" -> Log.d(TAG, "Not implemented in current UI flow")
                                     "recover_orders" -> mainViewModel.recoverOrdersWithToast()
                                     "manage_entitlements" -> mainViewModel.checkEntitlementsWithToast()
                                     else -> Log.w(TAG, "未知功能：$action")
@@ -127,12 +129,12 @@ class MainActivity : ComponentActivity() {
                             nonConsumableProducts = nonConsumableProducts,
                             onPurchaseClick = { productId, offerId ->
                                 // 直接调用购买函数，传入当前 Activity
-                                mainViewModel.purchaseProduct(this@MainActivity, productId, offerId)
+                                mainViewModel.purchaseProduct(WeakReference(this@MainActivity), productId, offerId)
                             },
                             onFeatureClick = { action ->
                                 // 根据 action 直接调用对应函数
                                 when (action) {
-                                    "query_products" -> mainViewModel.queryProductsWithToast()
+                                    "query_products" -> Log.d(TAG, "Not implemented in current UI flow")
                                     "recover_orders" -> mainViewModel.recoverOrdersWithToast()
                                     "manage_entitlements" -> mainViewModel.checkEntitlementsWithToast()
                                     else -> Log.w(TAG, "未知功能：$action")
@@ -177,7 +179,7 @@ class MainActivity : ComponentActivity() {
                     // 如果超过 3 秒还没收到 VIP 状态，主动检查一次
                     if (mainViewModel.uiState.value is MainViewModel.UiState.Loading) {
                         Log.d(TAG, "SDK 初始化超时，主动检查 VIP 状态")
-                        mainViewModel.actionCheckVipStatus()
+                        mainViewModel.checkEntitlementsWithToast()
                     }
                 }
             }
@@ -490,7 +492,7 @@ fun MainContent(
  */
 @Composable
 fun ProductCard(
-    product: PaymentProductDetails,
+    product: StoreProduct,
     isSelected: Boolean = false,
     onSelect: () -> Unit = {},
     onPurchase: (String, String) -> Unit = { _, _ -> }
@@ -532,9 +534,10 @@ fun ProductCard(
                     Spacer(modifier = Modifier.height(8.dp))
                     
                     Text(
-                        text = "类型：${when (product.productType) {
-                            PaymentProductType.SUBS -> "订阅商品"
-                            PaymentProductType.INAPP -> "一次性商品"
+                        text = "类型：${when (product.type) {
+                            ProductType.SUBS -> "订阅商品"
+                            ProductType.INAPP -> "一次性商品"
+                            else -> "未知"
                         }}",
                         fontSize = 12.sp,
                         color = Color.Blue

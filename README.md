@@ -18,16 +18,35 @@ PayKit 是一个轻量级的 Android 支付结算库，封装了 Google Play Bil
 
 ### 步骤 1：添加依赖
 
-在 `build.gradle` 中添加：
+**方式 A：JitPack（推荐）**
 
-```gradle
+在 `settings.gradle.kts` 加入仓库：
+
+```kotlin
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url = uri("https://jitpack.io") }
+    }
+}
+```
+
+在 `app/build.gradle.kts` 添加依赖（版本用 Git Tag，如 `v1.0.0`）：
+
+```kotlin
 dependencies {
-    // Google Billing Library
-    implementation "com.android.billingclient:billing:8.3.0"
-    implementation "com.android.billingclient:billing-ktx:8.3.0"
-    
-    // PayKit SDK (本地模块或远程依赖)
-    implementation project(':pay')
+    implementation("com.github.e-hai:PayKit:v1.0.0")
+}
+```
+
+> Billing 依赖已由 SDK 传递引入，宿主一般不必再单独声明。
+
+**方式 B：本地模块**
+
+```kotlin
+dependencies {
+    implementation(project(":pay"))
 }
 ```
 

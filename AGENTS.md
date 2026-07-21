@@ -49,6 +49,8 @@ PayKit/
 implementation(project(":pay"))
 ```
 
+JitPack：`jitpack.yml` 只发布 `:pay`；`pay/build.gradle.kts` 使用 `maven-publish`，坐标 `com.github.e-hai:PayKit:<tag>`。
+
 ## Build Toolchain
 
 全部使用 **Kotlin DSL**（`.gradle.kts`），版本集中在 `gradle/libs.versions.toml`。

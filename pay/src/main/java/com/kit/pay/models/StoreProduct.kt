@@ -1,23 +1,30 @@
 package com.kit.pay.models
 
 /**
- * 等同于 RevenueCat 的 StoreProduct。
- * 代表来自底层的购买项。在 Google Play 中它其实是包含一个特定 Offer 的 ProductDetails 的概念封装。
+ * 代表来自底层商店的可购买项。在 Google Play 中它其实是包含一个特定 Offer 的 ProductDetails 的概念封装。
  */
 data class StoreProduct(
     val productId: String,
     val type: ProductType,
     val title: String,
     val description: String,
-    val price: String,             // 格式化后的价格（例如 "$9.99"）
+    val price: String,             // 格式化后的价格（例如 "$9.99"，多为首个定价阶段）
     val priceAmountMicros: Long,
     val priceCurrencyCode: String,
-    
-    // 如果是 Google 订阅，这代表具体的 offerId 与 basePlanId 结合体
-    // 开发层直接传入 StoreProduct 发起购买即可，不用再手动穿透找 offerToken
+
+    /** 订阅必填：对应 Google offerToken */
     val subscriptionToken: String? = null,
-    
-    // 隐藏的底层原始凭证对象，用于直接发起购买，避免二次查询
+
+    /** 订阅 base plan ID（如 monthly / yearly） */
+    val basePlanId: String? = null,
+
+    /** 订阅优惠 ID；基础价 offer 可能为 null */
+    val offerId: String? = null,
+
+    /** 首个定价阶段价格为 0 时视为含免费试用 */
+    val hasFreeTrial: Boolean = false,
+
+    /** 底层 ProductDetails，购买用；不可序列化依赖 */
     @Transient val nativeProductDetails: Any? = null
 )
 

@@ -6,6 +6,7 @@ import com.android.billingclient.api.*
 import com.kit.pay.interfaces.ErrorCode
 import com.kit.pay.interfaces.PayKitError
 import com.kit.pay.models.ProductType
+import com.kit.pay.models.PurchaseState
 import com.kit.pay.models.StoreProduct
 import com.kit.pay.models.StoreTransaction
 import com.kit.pay.utils.LogUtil
@@ -26,6 +27,14 @@ import java.lang.ref.WeakReference
 class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
     PurchasesUpdatedListener {
 
+    private companion object {
+        private val TAG = LogUtil.TAG_BILLING
+    }
+
+    private fun logD(msg: String) = LogUtil.d(TAG, msg)
+    private fun logE(msg: String) = LogUtil.e(TAG, msg)
+    private fun logW(msg: String) = LogUtil.w(TAG, msg)
+
     private val billingClient: BillingClient = BillingClient.newBuilder(applicationContext)
         .enablePendingPurchases(    //启用对“待处理购买交易”的支持，即用户未完成支付的订单
             PendingPurchasesParams.newBuilder()
@@ -39,7 +48,7 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
 
     override fun startConnection(onConnected: () -> Unit, onError: (PayKitError) -> Unit) {
         if (billingClient.isReady) {
-            LogUtil.d("google play billing 已经连接")
+            logD("connect skip reason=already_ready")
             onConnected()
             return
         }
@@ -47,64 +56,63 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
         billingClient.startConnection(object : BillingClientStateListener {
             override fun onBillingSetupFinished(billingResult: BillingResult) {
                 if (billingResult.responseCode == BillingClient.BillingResponseCode.OK) {
-                    LogUtil.d("google play billing 连接成功")
+                    logD("connect success")
                     onConnected()
                 } else {
-                    LogUtil.d("google play billing 连接失败：${billingResult.toPayKitError()}")
+                    logE("connect fail code=${billingResult.responseCode} msg=${billingResult.debugMessage}")
                     onError(billingResult.toPayKitError())
                 }
             }
 
             override fun onBillingServiceDisconnected() {
-                LogUtil.e("google play billing 已经断开连接")
+                logE("connect disconnected autoReconnect=true")
                 //已开启 enableAutoServiceReconnection() 自动重新建立连接，因此该方法留空，无需再实现重连逻辑
             }
         })
     }
 
     /**
-     * 确保连接可用，如果未连接则等待连接完成
+     * 确保连接可用；未连接时尝试重连并等待，超时返回 false。
      */
     private suspend fun ensureConnected(): Boolean {
         if (billingClient.isReady) {
             return true
         }
 
-        LogUtil.d("检测到连接不可用，等待连接...")
+        logD("ensureConnected start waitMs=10000")
+        startConnection(
+            onConnected = {},
+            onError = {}
+        )
 
-        // 最多等待 10 秒
         var waitTime = 0
         val maxWaitTime = 10000
         val checkInterval = 500
 
         while (waitTime < maxWaitTime) {
             if (billingClient.isReady) {
-                LogUtil.d("连接已恢复")
+                logD("ensureConnected success")
                 return true
             }
-
-            // 如果未在连接中，主动发起连接
-            LogUtil.d("主动发起连接请求")
-            startConnection(
-                onConnected = {},
-                onError = {}
-            )
-
             delay(checkInterval.toLong())
             waitTime += checkInterval
         }
 
-        LogUtil.e("等待连接超时")
+        logE("ensureConnected timeout waitMs=10000")
         return false
+    }
+
+    private fun notConnectedError(): PayKitError {
+        return PayKitError(ErrorCode.STORE_PROBLEM, "Google Play Billing not connected")
     }
 
     override suspend fun queryProductDetailsAsync(
         productType: ProductType,
         productIds: Set<String>
     ): Result<List<StoreProduct>> {
-        // 确保连接可用
         if (!ensureConnected()) {
-            LogUtil.e("google play billing 重新连接失败")
+            logE("queryProductDetails abort reason=not_connected type=$productType ids=$productIds")
+            return Result.failure(notConnectedError())
         }
         val queryParams = QueryProductDetailsParams.newBuilder().setProductList(
             productIds.map { id ->
@@ -129,7 +137,7 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
         }
 
         return if (billingResult.responseCode == BillingClient.BillingResponseCode.OK) {
-            LogUtil.d("google play billing 查询商品成功")
+            logD("queryProductDetails success type=$productType requested=${productIds.size} fetched=${productDetailsList?.size ?: 0} unfetched=${unfetchedProductList.size}")
             val allStoreProducts = mutableListOf<StoreProduct>()
 
             // 1. 处理已获取到的商品
@@ -146,7 +154,7 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
 
             Result.success(allStoreProducts)
         } else {
-            LogUtil.e("google play billing 查询商品失败：${billingResult.toPayKitError()}")
+            logE("queryProductDetails fail type=$productType code=${billingResult.responseCode} msg=${billingResult.debugMessage}")
             Result.failure(billingResult.toPayKitError())
         }
     }
@@ -158,12 +166,11 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
      */
     private fun logProductDetails(productDetails: ProductDetails?) {
         productDetails ?: return
-        LogUtil.d(
-            "商品- ID:${productDetails.productId} " +
-                    "类型:${productDetails.productType} " +
-                    "名称:${productDetails.name} " +
-                    "标题:${productDetails.title} " +
-                    "简介:${productDetails.description}"
+        logD(
+            "productDetail id=${productDetails.productId} " +
+                "type=${productDetails.productType} " +
+                "name=${productDetails.name} " +
+                "title=${productDetails.title}"
         )
 
         // 订阅商品详情
@@ -185,7 +192,7 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
     }
 
     private fun logSubscriptionOfferDetails(sub: ProductDetails.SubscriptionOfferDetails) {
-        LogUtil.d(
+        logD(
             """
             
             ┌─────────────────────────────────────┐
@@ -205,7 +212,7 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
             val remainingMonths = installment.subsequentInstallmentPlanCommitmentPaymentsCount
             val paidMonths = totalMonths - remainingMonths
 
-            LogUtil.d(
+            logD(
                 """
                 ├─ 分期付款计划:
                 │  ├─ 总分期期数：$totalMonths 个月
@@ -217,7 +224,7 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
         }
 
         // 定价阶段详情
-        LogUtil.d("├─ 定价阶段 (共 ${sub.pricingPhases.pricingPhaseList.size} 个):")
+        logD("├─ 定价阶段 (共 ${sub.pricingPhases.pricingPhaseList.size} 个):")
 
         //关于有效期单位（billingPeriod），遵循 ISO 8601 格式： P1W 代表一周，P1M 代表一个月，P3M 代表三个月，P6M 代表 6 个月，P1Y 代表一年.
         //例如，对于 FormattedPrice$6.99 和 billingPeriod P1M，如果 billingCycleCount 为 2，则用户将收取 6.99 美元/月的费用，为期 2 个月。
@@ -236,7 +243,7 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
                 else -> ""
             }
 
-            LogUtil.d(
+            logD(
                 """
                 │  阶段 #${index + 1} $phaseDescription
                 │  ├─ 价格 (微美元): ${pricing.priceAmountMicros}
@@ -249,11 +256,11 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
             )
         }
 
-        LogUtil.d("└─────────────────────────────────────\n")
+        logD("└─────────────────────────────────────\n")
     }
 
     private fun logOneTimePurchaseOfferDetails(oneTime: ProductDetails.OneTimePurchaseOfferDetails) {
-        LogUtil.d(
+        logD(
             """
                         
                 ┌─────────────────────────────────────┐
@@ -323,26 +330,23 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
      * UNKNOWN = 0‌：未知错误。
      * **/
     private fun logUnfetchedProduct(productId: String, productType: ProductType) {
-        LogUtil.d(
-            "未获取到的商品- ID:${productId} " + "类型:${productType}"
-        )
+        logD("queryProductDetails unfetched id=$productId type=$productType")
     }
 
     override suspend fun makePurchaseAsync(
         activity: WeakReference<Activity>,
-        storeProduct: StoreProduct
+        storeProduct: StoreProduct,
+        isOfferPersonalized: Boolean
     ): Result<Unit> {
-        // 确保连接可用
         if (!ensureConnected()) {
-            LogUtil.e("google play billing 重新连接失败")
+            logE("makePurchase abort reason=not_connected productId=${storeProduct.productId}")
+            return Result.failure(notConnectedError())
         }
         val pDetail = storeProduct.nativeProductDetails as? ProductDetails
             ?: return Result.failure(
-                Exception(
-                    PayKitError(
-                        ErrorCode.PRODUCT_NOT_AVAILABLE,
-                        "Cached Product details not found"
-                    ).message
+                PayKitError(
+                    ErrorCode.PRODUCT_NOT_AVAILABLE,
+                    "Cached Product details not found"
                 )
             )
 
@@ -353,11 +357,9 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
 
         val productDetailsParamsList = if (gType == BillingClient.ProductType.SUBS) {
             val token = storeProduct.subscriptionToken ?: return Result.failure(
-                Exception(
-                    PayKitError(
-                        ErrorCode.PRODUCT_NOT_AVAILABLE,
-                        "Missing offer token for subs"
-                    ).message
+                PayKitError(
+                    ErrorCode.PRODUCT_NOT_AVAILABLE,
+                    "Missing offer token for subs"
                 )
             )
             listOf(
@@ -376,20 +378,24 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
 
         val flowParams = BillingFlowParams.newBuilder()
             .setProductDetailsParamsList(productDetailsParamsList)
+            .setIsOfferPersonalized(isOfferPersonalized)
             .build()
         val activity = activity.get() ?: return Result.failure(
-            Exception(
-                PayKitError(
-                    ErrorCode.UNKNOWN,
-                    "Activity not found"
-                ).message
+            PayKitError(
+                ErrorCode.UNKNOWN,
+                "Activity not found"
             )
         )
         val response = billingClient.launchBillingFlow(activity, flowParams)
 
         return if (response.responseCode != BillingClient.BillingResponseCode.OK) {
+            logE("launchBillingFlow fail productId=${storeProduct.productId} code=${response.responseCode} msg=${response.debugMessage}")
             Result.failure(response.toPayKitError())
         } else {
+            logD(
+                "launchBillingFlow success productId=${storeProduct.productId} " +
+                    "type=${storeProduct.type} personalized=$isOfferPersonalized"
+            )
             Result.success(Unit)
         }
     }
@@ -414,11 +420,13 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
      */
     override fun onPurchasesUpdated(billingResult: BillingResult, purchases: List<Purchase>?) {
         if (billingResult.responseCode == BillingClient.BillingResponseCode.OK && purchases != null) {
+            logD("onPurchasesUpdated success count=${purchases.size}")
             val transactions = purchases.map { it.toStoreTransaction() }
             purchasesUpdatedListener?.onPurchasesUpdated(transactions)
         } else {
             val isCancelled =
                 billingResult.responseCode == BillingClient.BillingResponseCode.USER_CANCELED
+            logE("onPurchasesUpdated fail code=${billingResult.responseCode} cancelled=$isCancelled msg=${billingResult.debugMessage}")
             purchasesUpdatedListener?.onPurchasesFailedToUpdate(
                 billingResult.toPayKitError(),
                 isCancelled
@@ -429,16 +437,16 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
     override suspend fun queryPurchasesAsync(
         productType: ProductType
     ): Result<List<StoreTransaction>> {
-        // 确保连接可用
         if (!ensureConnected()) {
-            LogUtil.e("google play billing 重新连接失败")
+            logE("queryPurchases abort reason=not_connected type=$productType")
+            return Result.failure(notConnectedError())
         }
         val queryParams = QueryPurchasesParams.newBuilder()
             .setProductType(
                 if (productType == ProductType.SUBS)
-                    BillingClient.ProductType.INAPP
-                else
                     BillingClient.ProductType.SUBS
+                else
+                    BillingClient.ProductType.INAPP
             )
             .build()
 
@@ -447,17 +455,19 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
         val list = result.purchasesList
 
         return if (billingResult.responseCode == BillingClient.BillingResponseCode.OK) {
+            logD("queryPurchases success type=$productType count=${list.size}")
             logPurchases(list)
             val allTransactions = list.map { it.toStoreTransaction() }
             Result.success(allTransactions)
         } else {
+            logE("queryPurchases fail type=$productType code=${billingResult.responseCode} msg=${billingResult.debugMessage}")
             Result.failure(billingResult.toPayKitError())
         }
     }
 
     private fun logPurchases(purchaseDetailsList: List<Purchase>) {
         purchaseDetailsList.forEach {
-            LogUtil.d("purchase: ${it.orderId} ${it.products} ${it.purchaseState} ${it.purchaseToken} ${it.isAcknowledged}")
+            logD("purchase orderId=${it.orderId} products=${it.products} state=${it.purchaseState} acknowledged=${it.isAcknowledged} token=${it.purchaseToken}")
         }
     }
 
@@ -465,9 +475,9 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
         transaction: StoreTransaction,
         isConsumable: Boolean
     ): Result<Unit> {
-        // 确保连接可用
         if (!ensureConnected()) {
-            LogUtil.e("google play billing 重新连接失败")
+            logE("consumeAndAcknowledge abort reason=not_connected orderId=${transaction.orderId}")
+            return Result.failure(notConnectedError())
         }
 
         if (transaction.isAcknowledged) {
@@ -479,8 +489,10 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
                 ConsumeParams.newBuilder().setPurchaseToken(transaction.purchaseToken).build()
             val billingResult = billingClient.consumePurchase(consumeParams).billingResult
             return if (billingResult.responseCode == BillingClient.BillingResponseCode.OK) {
+                logD("consume success orderId=${transaction.orderId} products=${transaction.productIds}")
                 Result.success(Unit)
             } else {
+                logE("consume fail orderId=${transaction.orderId} code=${billingResult.responseCode} msg=${billingResult.debugMessage}")
                 Result.failure(billingResult.toPayKitError())
             }
         } else {
@@ -489,8 +501,10 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
                     .build()
             val billingResult = billingClient.acknowledgePurchase(ackParams)
             return if (billingResult.responseCode == BillingClient.BillingResponseCode.OK) {
+                logD("acknowledge success orderId=${transaction.orderId} products=${transaction.productIds}")
                 Result.success(Unit)
             } else {
+                logE("acknowledge fail orderId=${transaction.orderId} code=${billingResult.responseCode} msg=${billingResult.debugMessage}")
                 Result.failure(billingResult.toPayKitError())
             }
         }
@@ -505,64 +519,6 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
 
 // ================= Extension Mappers =================
 private fun BillingResult.toPayKitError(): PayKitError {
-    when (this.responseCode) {
-        BillingClient.BillingResponseCode.SERVICE_TIMEOUT -> {
-            LogUtil.d("服务超时: 表示服务请求超时。这通常发生在网络连接中断或设备处于低电量状态时")
-        }
-
-        BillingClient.BillingResponseCode.USER_CANCELED -> {
-            LogUtil.d("用户取消: 表示用户取消了购买或订阅操作。这通常发生在用户在购买流程中主动退出时")
-        }
-
-        BillingClient.BillingResponseCode.ITEM_NOT_OWNED -> {
-            LogUtil.d("商品未购买: 当请求的商品并未购买时返回此错误码。常见于查询未完成购买的商品或查询用户尚未购买的商品")
-        }
-
-        BillingClient.BillingResponseCode.FEATURE_NOT_SUPPORTED -> {
-            LogUtil.d("特性不支持: 当设备或应用不支持请求的特性时返回此错误码。例如，设备不支持某些高级功能")
-        }
-
-        BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED -> {
-            LogUtil.d("商品已购买: 当用户尝试购买一个已经拥有的商品时，会返回此错误码。通常不需要再进行购买操作")
-        }
-
-        BillingClient.BillingResponseCode.DEVELOPER_ERROR -> {
-            LogUtil.d("开发者错误: 当请求出现开发者错误时（例如请求参数错误、调用顺序错误等），将返回此错误码")
-        }
-
-        BillingClient.BillingResponseCode.SERVICE_DISCONNECTED -> {
-            LogUtil.d("服务断开: 表示与结算服务的连接断开。这通常是暂时性的网络问题，可以稍后重试")
-        }
-
-        BillingClient.BillingResponseCode.SERVICE_UNAVAILABLE -> {
-            LogUtil.d("服务不可用: 当结算服务不可用时，可能是由于服务器问题或网络连接不佳，通常是临时的，可以稍后重试")
-        }
-
-        BillingClient.BillingResponseCode.BILLING_UNAVAILABLE -> {
-            LogUtil.d("计费不可用: 表示当前设备无法使用计费服务，可能因为设备或地区的限制，或者该设备不支持结算服务")
-        }
-
-        BillingClient.BillingResponseCode.ITEM_UNAVAILABLE -> {
-            LogUtil.d("商品不可用: 当请求的商品不可用时返回。可能是该商品已被下架或不适用于当前设备")
-        }
-
-        BillingClient.BillingResponseCode.ERROR -> {
-            LogUtil.d("一般错误: 这表示发生了一个通用错误。通常这种情况需要开发人员进一步调查")
-        }
-
-        BillingClient.BillingResponseCode.OK -> {
-            LogUtil.d("操作成功")
-        }
-
-        BillingClient.BillingResponseCode.NETWORK_ERROR -> {
-            LogUtil.d("网络错误: 表示与结算服务之间的网络连接失败。这通常是由于网络问题导致的，可以稍后重试")
-        }
-
-        else -> {
-            LogUtil.d("未知错误=${this.responseCode} ${this.debugMessage}")
-        }
-    }
-
     val code = when (this.responseCode) {
         BillingClient.BillingResponseCode.USER_CANCELED -> ErrorCode.PURCHASE_CANCELLED
 
@@ -574,6 +530,10 @@ private fun BillingResult.toPayKitError(): PayKitError {
 
         else -> ErrorCode.STORE_PROBLEM
     }
+    LogUtil.d(
+        LogUtil.TAG_BILLING,
+        "billingResult code=${this.responseCode} payKitCode=$code msg=${this.debugMessage}"
+    )
     return PayKitError(code, this.debugMessage)
 }
 
@@ -598,6 +558,7 @@ private fun ProductDetails.toStoreProducts(type: ProductType): List<StoreProduct
     } else {
         this.subscriptionOfferDetails?.forEach { subOffer ->
             val phase = subOffer.pricingPhases.pricingPhaseList.firstOrNull()
+            val hasFreeTrial = phase != null && phase.priceAmountMicros == 0L
             list.add(
                 StoreProduct(
                     productId = this.productId,
@@ -608,6 +569,9 @@ private fun ProductDetails.toStoreProducts(type: ProductType): List<StoreProduct
                     priceAmountMicros = phase?.priceAmountMicros ?: 0,
                     priceCurrencyCode = phase?.priceCurrencyCode ?: "",
                     subscriptionToken = subOffer.offerToken,
+                    basePlanId = subOffer.basePlanId,
+                    offerId = subOffer.offerId,
+                    hasFreeTrial = hasFreeTrial,
                     nativeProductDetails = this
                 )
             )
@@ -622,6 +586,11 @@ private fun Purchase.toStoreTransaction(): StoreTransaction {
         productIds = this.products,
         purchaseTime = this.purchaseTime,
         purchaseToken = this.purchaseToken,
-        isAcknowledged = this.isAcknowledged
+        isAcknowledged = this.isAcknowledged,
+        purchaseState = when (this.purchaseState) {
+            Purchase.PurchaseState.PURCHASED -> PurchaseState.PURCHASED
+            Purchase.PurchaseState.PENDING -> PurchaseState.PENDING
+            else -> PurchaseState.UNSPECIFIED
+        }
     )
 }

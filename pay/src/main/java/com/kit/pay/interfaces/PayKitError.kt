@@ -11,6 +11,7 @@ data class PayKitError(
 enum class ErrorCode {
     STORE_PROBLEM,           // 原厂商店报错或断连
     PURCHASE_CANCELLED,      // 用户主动取消
+    PURCHASE_PENDING,        // 支付待确认（PENDING），尚未完成，勿发货
     PURCHASE_NOT_ALLOWED,    // 该设备不支持支付
     PRODUCT_NOT_AVAILABLE,   // 找不到发售商品
     NETWORK_ERROR,           // 网络问题

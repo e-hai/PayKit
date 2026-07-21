@@ -4,11 +4,12 @@ import android.content.Context
 import android.content.SharedPreferences
 import com.kit.pay.models.CustomerInfo
 import com.kit.pay.models.StoreTransaction
+import com.kit.pay.models.PurchaseState
 import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * 等同于 RevenueCat 的 DeviceCache。
+ * 本地权益缓存。
  * 负责本地状态持久化，实现弱网环境秒开发放权益的刚需。
  */
 class DeviceCache(context: Context) {
@@ -51,6 +52,7 @@ class DeviceCache(context: Context) {
             txnObj.put("purchaseTime", txn.purchaseTime)
             txnObj.put("purchaseToken", txn.purchaseToken)
             txnObj.put("isAcknowledged", txn.isAcknowledged)
+            txnObj.put("purchaseState", txn.purchaseState.name)
             recordsArray.put(txnObj)
         }
         rootObj.put("allPurchaseRecords", recordsArray)
@@ -102,7 +104,12 @@ class DeviceCache(context: Context) {
                             productIds = pIds,
                             purchaseTime = txnObj.optLong("purchaseTime", 0L),
                             purchaseToken = txnObj.optString("purchaseToken", ""),
-                            isAcknowledged = txnObj.optBoolean("isAcknowledged", true)
+                            isAcknowledged = txnObj.optBoolean("isAcknowledged", true),
+                            purchaseState = runCatching {
+                                PurchaseState.valueOf(
+                                    txnObj.optString("purchaseState", PurchaseState.PURCHASED.name)
+                                )
+                            }.getOrDefault(PurchaseState.PURCHASED)
                         )
                     )
                 }

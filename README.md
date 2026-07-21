@@ -38,9 +38,9 @@ dependencies {
 ```kotlin
 // Constants.kt
 object Constants {
-    // 订阅商品
-    const val SUBS_PRODUCT_MONTH = "sub_monthly"
-    const val SUBS_PRODUCT_YEAR = "sub_yearly"
+    // 一个订阅 product 对应一个权益档；月/年在 Play Console 配为 base plan
+    const val SUBS_PLUS = "subs_plus"
+    const val SUBS_PRO = "subs_pro"
     
     // 消耗型商品（可重复购买）
     const val CONSUMABLE_COINS_100 = "coins_100"
@@ -61,8 +61,8 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         // 1. 配置商品类型
         val configuration = PayKitConfiguration(
             subsProductIds = setOf(
-                Constants.SUBS_PRODUCT_MONTH,
-                Constants.SUBS_PRODUCT_YEAR
+                Constants.SUBS_PLUS,
+                Constants.SUBS_PRO
             ),
             consumableProductIds = setOf(
                 Constants.CONSUMABLE_COINS_100
@@ -85,8 +85,11 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     }
     
     private fun updateUiWithCustomerInfo(info: CustomerInfo) {
-        val isVip = info.activeSubscriptions.contains(Constants.SUBS_PRODUCT_MONTH) || 
-                    info.activeSubscriptions.contains(Constants.SUBS_PRODUCT_YEAR)
+        val tier = when {
+            Constants.SUBS_PRO in info.activeSubscriptions -> "Pro"
+            Constants.SUBS_PLUS in info.activeSubscriptions -> "Plus"
+            else -> "Free"
+        }
         // 更新 UI
     }
 }
@@ -102,7 +105,8 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 viewModelScope.launch {
     try {
         val productIds = setOf(
-            Constants.SUBS_PRODUCT_MONTH,
+            Constants.SUBS_PLUS,
+            Constants.SUBS_PRO,
             Constants.CONSUMABLE_COINS_100
         )
         
@@ -142,8 +146,12 @@ fun purchaseProduct(activity: Activity, productId: String) {
                             customerInfo: CustomerInfo
                         ) {
                             Log.d("PayKit", "支付成功: ${storeTransaction.orderId}")
-                            // 支付成功，SDK 已自动确认订单
-                            // 可以立即发放权益
+                            // 支付成功，SDK 已自动确认订单，可以立即发放权益
+                        }
+
+                        override fun onPending(storeTransaction: StoreTransaction) {
+                            Log.d("PayKit", "支付待确认: ${storeTransaction.orderId}")
+                            // 勿发货；付清后调用 restorePurchases() 或下次启动同步即可
                         }
 
                         override fun onError(error: PayKitError, userCancelled: Boolean) {
@@ -168,48 +176,56 @@ fun purchaseProduct(activity: Activity, productId: String) {
 ### 场景 3：检查用户权益
 
 ```kotlin
-// 方法 1：主动查询（推荐在应用启动时调用）
+// 方法 1：强制同步后查询（默认）
 viewModelScope.launch {
-    val customerInfo = PayKit.shared.getCustomerInfo()
+    val customerInfo = PayKit.shared.getCustomerInfo() // forceSync = true
     if (customerInfo != null) {
-        val isVip = customerInfo.activeSubscriptions.contains(Constants.SUBS_PRODUCT_MONTH)
-        Log.d("PayKit", "是否 VIP: $isVip")
+        val tier = when {
+            Constants.SUBS_PRO in customerInfo.activeSubscriptions -> "Pro"
+            Constants.SUBS_PLUS in customerInfo.activeSubscriptions -> "Plus"
+            else -> "Free"
+        }
+        val pending = customerInfo.pendingPurchases
+        Log.d("PayKit", "当前档位: $tier, 待确认: ${pending.size}")
     }
 }
 
-// 方法 2：通过监听器自动接收更新（已在初始化时设置）
-// 当权益状态变化时，UpdatedCustomerInfoListener 会自动回调
+// 方法 2：只读本地缓存（弱网秒开）
+viewModelScope.launch {
+    val cached = PayKit.shared.getCustomerInfo(forceSync = false)
+}
+
+// 方法 3：通过监听器自动接收更新（已在初始化时设置）
 ```
 
-### 场景 4：恢复未完成订单
+### 场景 4：恢复购买 / 补单
 
-**重要：** 每次应用启动时调用，防止掉单。
+Google 没有独立的「恢复购买」系统 API；SDK 通过重新 `queryPurchases` 实现该产品能力。
 
 ```kotlin
-fun recoverUnfinishedOrders() {
+// 「恢复购买」按钮
+fun onRestoreClick() {
     viewModelScope.launch {
-        try {
-            // getCustomerInfo 内部会自动查询并确认未完成的订单
-            val customerInfo = PayKit.shared.getCustomerInfo()
-            
-            if (customerInfo != null) {
-                Log.d("PayKit", "订单恢复完成")
-                Log.d("PayKit", "活跃订阅: ${customerInfo.activeSubscriptions}")
-                Log.d("PayKit", "已购商品: ${customerInfo.nonSubscriptionTransactions}")
-            } else {
-                Log.e("PayKit", "订单恢复失败")
+        PayKit.shared.restorePurchases()
+            .onSuccess { info ->
+                Log.d("PayKit", "恢复完成: ${info.activeSubscriptions}")
             }
-        } catch (e: Exception) {
-            Log.e("PayKit", "恢复订单异常: ${e.message}")
-        }
+            .onFailure { e ->
+                Log.e("PayKit", "恢复失败: ${e.message}")
+            }
     }
+}
+
+// 与 restorePurchases() 等价，语义偏「同步/补单」
+suspend fun refresh() {
+    PayKit.shared.syncPurchases()
 }
 ```
 
 **最佳实践：**
-- 在 `Application.onCreate()` 或 `MainActivity.onCreate()` 中调用
-- 在 SDK 初始化完成后立即调用
-- 提供"恢复购买"按钮供用户手动触发
+- 启动时 SDK 连接成功后会**自动 sync**；宿主用 `getCustomerInfo(forceSync = false)` 秒开 + `UpdatedCustomerInfoListener` 收同步结果即可，**不必再 forceSync 一次**
+- 提供「恢复购买」按钮供用户手动触发（调用 `restorePurchases()`）
+- 已消耗的消耗型商品无法恢复
 
 ---
 
@@ -218,13 +234,27 @@ fun recoverUnfinishedOrders() {
 ### PayKit 单例
 
 ```kotlin
-// 获取单例
 val payKit = PayKit.shared
 
-// 主要方法
 suspend fun getProducts(productIds: Set<String>): Result<List<StoreProduct>>
-suspend fun getCustomerInfo(): CustomerInfo?
+suspend fun getCustomerInfo(forceSync: Boolean = true): CustomerInfo?
+
+/** 同步购买 / 补单 */
+suspend fun syncPurchases(): Result<CustomerInfo>
+/** 「恢复购买」按钮；实现同 syncPurchases */
+suspend fun restorePurchases(): Result<CustomerInfo>
+
+suspend fun getPendingPurchases(): List<StoreTransaction>
+suspend fun getPurchaseHistory(): List<StoreTransaction>
+fun findTransaction(purchaseToken: String): StoreTransaction?
+
 fun purchase(activity: Activity, storeProduct: StoreProduct, callback: PurchaseCallback)
+fun purchase(
+    activity: Activity,
+    storeProduct: StoreProduct,
+    callback: PurchaseCallback,
+    isOfferPersonalized: Boolean  // 欧盟个性化报价披露，默认取 Configuration
+)
 fun setUpdatedCustomerInfoListener(listener: UpdatedCustomerInfoListener?)
 ```
 
@@ -234,8 +264,12 @@ fun setUpdatedCustomerInfoListener(listener: UpdatedCustomerInfoListener?)
 ```kotlin
 data class CustomerInfo(
     val activeSubscriptions: Set<String>,           // 活跃的订阅商品 ID
-    val nonSubscriptionTransactions: List<StoreTransaction>  // 非订阅交易列表
-)
+    val nonConsumablePurchases: Set<String>,        // 已拥有的非消耗商品 ID
+    val allPurchaseRecords: List<StoreTransaction>  // 购买记录（含 PENDING）
+) {
+    val pendingPurchases: List<StoreTransaction>    // 待确认
+    val purchasedRecords: List<StoreTransaction>    // 已支付
+}
 ```
 
 #### StoreProduct - 商品详情
@@ -259,8 +293,21 @@ data class StoreTransaction(
     val productIds: List<String>,   // 商品 ID 列表
     val purchaseTime: Long,         // 购买时间戳
     val purchaseToken: String,      // 购买令牌
-    val isAcknowledged: Boolean     // 是否已确认
+    val isAcknowledged: Boolean,    // 是否已确认
+    val purchaseState: PurchaseState // PURCHASED / PENDING / UNSPECIFIED
 )
+```
+
+#### ErrorCode - 错误码
+```kotlin
+enum class ErrorCode {
+    OK,                      // 成功
+    PURCHASE_CANCELLED,      // 用户取消
+    PURCHASE_PENDING,        // 支付待确认（勿发货）
+    PRODUCT_NOT_AVAILABLE,   // 商品不可用
+    NETWORK_ERROR,           // 网络错误
+    STORE_PROBLEM            // 商店问题
+}
 ```
 
 ### 枚举类型
@@ -273,14 +320,12 @@ enum class ProductType {
 }
 ```
 
-#### ErrorCode - 错误码
+#### PurchaseState - 订单支付状态
 ```kotlin
-enum class ErrorCode {
-    OK,                      // 成功
-    PURCHASE_CANCELLED,      // 用户取消
-    PRODUCT_NOT_AVAILABLE,   // 商品不可用
-    NETWORK_ERROR,           // 网络错误
-    STORE_PROBLEM            // 商店问题
+enum class PurchaseState {
+    PURCHASED,    // 已支付，可确认并发货
+    PENDING,      // 待确认，勿发货
+    UNSPECIFIED   // 无效/未知
 }
 ```
 
@@ -318,17 +363,21 @@ enum class ErrorCode {
    - 区分大小写
 
 3. **订单确认**：
-   - SDK 会自动确认所有订单，无需手动处理
+   - SDK 仅对 `PURCHASED` 状态自动确认，无需手动处理
+   - `PENDING`（待支付确认）不会 acknowledge / consume，也不会发放权益
    - 订阅和非消耗商品调用 `acknowledgePurchase`
    - 消耗商品调用 `consumePurchase`
 
 4. **线程安全**：
    - 所有 suspend 函数应在协程中调用
    - 推荐使用 `viewModelScope.launch`
+   - `PurchaseCallback` / `UpdatedCustomerInfoListener` **已在主线程回调**，可直接更新 UI
 
-5. **欧盟政策**：
-   - SDK 已启用个性化报价支持
-   - 符合欧盟数字服务法案要求
+5. **欧盟个性化报价**：
+   - 若价格经自动化决策对用户个性化，购买时需声明，Play 会在支付页展示披露文案
+   - 配置默认值：`PayKitConfiguration(isOfferPersonalizedDefault = true)`
+   - 或单次覆盖：`purchase(activity, product, callback, isOfferPersonalized = true)`
+   - 未做个性化定价时可保持默认 `false`
 
 ---
 
@@ -348,13 +397,19 @@ enum class ErrorCode {
 **A:** 定期调用 `getCustomerInfo()` 检查订阅状态，SDK 会自动更新 `activeSubscriptions`。
 
 ### Q4: 支付成功后如何发放权益？
-**A:** 在 `PurchaseCallback.onCompleted` 中立即发放权益，SDK 已确保订单已确认。
+**A:** 在 `PurchaseCallback.onCompleted` 中立即发放权益，SDK 已确保订单为 `PURCHASED` 并已确认。
 
-### Q5: 为什么需要恢复订单？
-**A:** 防止以下场景导致掉单：
-- 用户在支付过程中应用被强退
-- 网络问题导致确认失败
-- 跨设备购买需要同步权益
+### Q5: 收到 `onPending` 怎么办？
+**A:** 表示支付尚未完成（如现金/银行转账）。不要发货；提示用户等待确认。支付完成后调用 `restorePurchases()` / `syncPurchases()` 或下次启动自动同步即可补单发货。
+
+### Q6: 为什么需要恢复购买？
+**A:** Google 无独立 Restore API；`restorePurchases()` 会重新查询当前账号购买并更新本地权益，用于：
+- 换机 / 重装后找回订阅与非消耗品
+- 用户在支付过程中应用被强退导致的补单
+- `PENDING` 订单后续变为 `PURCHASED`
+- 跨设备同步（同一 Google 账号）
+
+已消耗的消耗型商品无法通过恢复买回。
 
 ---
 
@@ -372,5 +427,8 @@ enum class ErrorCode {
 如有问题，请查看日志输出或联系开发团队。
 
 **关键日志标签：**
-- `PayKit`: SDK 核心日志
-- `GoogleBillingWrapper`: Google Play 交互日志
+- `PayKit`：SDK 核心（同步、购买、缓存）
+- `PayKit-Billing`：Google Play Billing 交互
+- `PayKit-Sample`：示例 App
+
+Logcat 过滤 `PayKit` 即可看到全部相关日志。消息为 `action key=value` 格式，便于搜索 `syncPurchases`、`purchase`、`acknowledge` 等。

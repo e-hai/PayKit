@@ -12,28 +12,27 @@ import com.kit.pay.interfaces.*
 import com.kit.pay.models.*
 import com.kit.pay.subscriber.CustomerInfoHelper
 import com.kit.pay.utils.LogUtil
+import com.kit.pay.utils.MainThreadDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.lang.ref.WeakReference
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * PayKit 核心单例类。
- * 
+ *
  * 负责管理支付流程的各个方面，包括：
  * - 商品查询和管理
  * - 支付发起和回调处理
  * - 订单确认和权益同步
  * - 用户权益状态监听
- * 
+ *
  * 使用示例：
  * ```kotlin
- * // 初始化
  * PayKit.configure(context, configuration)
- * 
- * // 获取单例
  * val payKit = PayKit.shared
  * ```
  */
@@ -46,8 +45,6 @@ class PayKit private constructor(
     private val deviceCache = DeviceCache(applicationContext)
     private val customerInfoHelper = CustomerInfoHelper(configuration)
     private val billingWrapper: BillingAbstract = GoogleBillingWrapper(applicationContext)
-
-    private val _isConfigured = AtomicBoolean(true)
     private var updateListener: UpdatedCustomerInfoListener? = null
 
     // 用于暂存由 Activity 发起的购买回调
@@ -58,168 +55,205 @@ class PayKit private constructor(
     }
 
     /**
-     * 初始化 SDK 内部组件。
-     * 
-     * 执行以下操作：
-     * 1. 从缓存中加载用户权益信息（如果有）
-     * 2. 连接 Google Play Billing 服务
-     * 3. 连接成功后自动同步购买记录
-     * 
-     * 此方法在 [configure] 中自动调用，无需手动调用。
+     * 初始化 SDK 内部组件：连接 Billing → 自动 [syncPurchasesInternal]。
+     * 本地缓存由宿主通过 [getCustomerInfo]（`forceSync = false`）按需读取。
      */
     private fun initialize() {
-        // 先快速吐出缓存，实现 "无等待/弱网" 秒加载逻辑
-        val cached = deviceCache.getCachedCustomerInfo()
-        if (cached != null) {
-            LogUtil.d("[PayKit] 缓存命中，直接返回 =$cached")
-            updateListener?.onReceived(cached)
-        }
-
         billingWrapper.startConnection(
             onConnected = {
-                // 连接成功，执行本地小票扫描
+                LogUtil.d("init connected startSync=true")
                 applicationScope.launch {
-                    syncPurchases()
+                    syncPurchasesInternal()
                 }
             },
             onError = { error ->
-                // 连接失败，静默失败即可，业务通过 getCustomerInfo 会获知
+                LogUtil.e("init connect fail code=${error.code} msg=${error.message}")
             }
         )
     }
 
+    private fun dispatchCustomerInfo(info: CustomerInfo) {
+        val listener = updateListener ?: return
+        MainThreadDispatcher.post { listener.onReceived(info) }
+    }
+
     /**
-     * 同步用户的购买记录并更新权益状态。
-     * 
-     * 执行流程：
-     * 1. 并行查询订阅商品和一次性商品的购买记录
-     * 2. 对未确认的订单进行确认或消耗
-     * 3. 计算最新的用户权益信息
-     * 4. 缓存权益信息并通知监听器
-     * 
-     * @return 最新的用户权益信息，如果查询失败则返回缓存的信息
+     * 取出当前购买回调并在主线程执行；保证只投递一次。
      */
-    private suspend fun syncPurchases(): CustomerInfo? {
+    private fun dispatchPurchaseCallback(block: (PurchaseCallback) -> Unit) {
+        val callback = activePurchaseCallback ?: return
+        activePurchaseCallback = null
+        MainThreadDispatcher.post { block(callback) }
+    }
+
+    /**
+     * 向 Google 同步购买记录：确认未处理的 PURCHASED、更新缓存与监听器。
+     *
+     * - SUBS / INAPP 并行查询
+     * - acknowledge / consume 失败的订单不计入活跃权益，且本方法返回 failure
+     */
+    private suspend fun syncPurchasesInternal(): Result<CustomerInfo> = coroutineScope {
+        LogUtil.d("syncPurchases start")
         val cachedInfo = deviceCache.getCachedCustomerInfo()
 
-        // 并行查询 SUBS 和 INAPP 两种类型的购买记录
-        val subsResult = billingWrapper.queryPurchasesAsync(ProductType.SUBS)
-        val inappResult = billingWrapper.queryPurchasesAsync(ProductType.INAPP)
+        val subsDeferred = async { billingWrapper.queryPurchasesAsync(ProductType.SUBS) }
+        val inappDeferred = async { billingWrapper.queryPurchasesAsync(ProductType.INAPP) }
+        val subsResult = subsDeferred.await()
+        val inappResult = inappDeferred.await()
 
-        // 合并两个结果
         val allTransactions = mutableListOf<StoreTransaction>()
+        subsResult.onSuccess { allTransactions.addAll(it) }
+        inappResult.onSuccess { allTransactions.addAll(it) }
 
-        subsResult.onSuccess { transactions ->
-            allTransactions.addAll(transactions)
-        }
+        LogUtil.d(
+            "syncPurchases queried " +
+                "subsOk=${subsResult.isSuccess} inappOk=${inappResult.isSuccess} " +
+                "count=${allTransactions.size}"
+        )
 
-        inappResult.onSuccess { transactions ->
-            allTransactions.addAll(transactions)
-        }
-
-        // 如果两个都失败，返回缓存
         if (subsResult.isFailure && inappResult.isFailure) {
-            return cachedInfo
-        }
-
-        // 处理所有的回执动作，没确认的去确认
-        for (txn in allTransactions) {
-            if (!txn.isAcknowledged) {
-                val isConsumable =
-                    txn.productIds.any { configuration.consumableProductIds.contains(it) }
-                billingWrapper.consumeAndAcknowledge(txn, isConsumable)
+            val error = subsResult.exceptionOrNull()
+                ?: inappResult.exceptionOrNull()
+                ?: PayKitError(ErrorCode.STORE_PROBLEM, "Failed to query purchases")
+            LogUtil.e("syncPurchases queryFail fallbackCache=${cachedInfo != null} msg=${error.message}")
+            return@coroutineScope if (cachedInfo != null) {
+                Result.success(cachedInfo)
+            } else {
+                Result.failure(error)
             }
         }
 
-        // 当所有发货处理完后，结算最新 CustomerInfo
-        val newInfo = customerInfoHelper.computeCustomerInfo(cachedInfo, allTransactions)
-        deviceCache.cacheCustomerInfo(newInfo)
-        updateListener?.onReceived(newInfo)
+        val transactionsForCompute = allTransactions.toMutableList()
+        var acknowledgeFailure: Throwable? = null
 
-        return newInfo
+        val purchasedTransactions = allTransactions.filter {
+            it.purchaseState == PurchaseState.PURCHASED
+        }
+        for (txn in purchasedTransactions) {
+            if (txn.isAcknowledged) {
+                continue
+            }
+            val isConsumable =
+                txn.productIds.any { configuration.consumableProductIds.contains(it) }
+            val ackResult = billingWrapper.consumeAndAcknowledge(txn, isConsumable)
+            if (ackResult.isSuccess) {
+                val index = transactionsForCompute.indexOfFirst {
+                    it.purchaseToken == txn.purchaseToken
+                }
+                if (index >= 0) {
+                    transactionsForCompute[index] = txn.copy(isAcknowledged = true)
+                }
+            } else {
+                val error = ackResult.exceptionOrNull()
+                    ?: PayKitError(ErrorCode.STORE_PROBLEM, "Acknowledge/consume failed")
+                LogUtil.e(
+                    "syncPurchases ackFail orderId=${txn.orderId} " +
+                        "products=${txn.productIds} consumable=$isConsumable msg=${error.message}"
+                )
+                if (acknowledgeFailure == null) {
+                    acknowledgeFailure = error
+                }
+            }
+        }
+
+        val newInfo = customerInfoHelper.computeCustomerInfo(cachedInfo, transactionsForCompute)
+        deviceCache.cacheCustomerInfo(newInfo)
+        dispatchCustomerInfo(newInfo)
+
+        return@coroutineScope if (acknowledgeFailure != null) {
+            LogUtil.e(
+                "syncPurchases done success=false " +
+                    "activeSubs=${newInfo.activeSubscriptions.size} " +
+                    "pending=${newInfo.pendingPurchases.size} " +
+                    "msg=${acknowledgeFailure.message}"
+            )
+            Result.failure(
+                PayKitError(
+                    ErrorCode.STORE_PROBLEM,
+                    "Failed to acknowledge/consume one or more purchases: ${acknowledgeFailure.message}"
+                )
+            )
+        } else {
+            LogUtil.d(
+                "syncPurchases done success=true " +
+                    "activeSubs=${newInfo.activeSubscriptions.size} " +
+                    "nonConsumables=${newInfo.nonConsumablePurchases.size} " +
+                    "pending=${newInfo.pendingPurchases.size} " +
+                    "records=${newInfo.allPurchaseRecords.size}"
+            )
+            Result.success(newInfo)
+        }
     }
 
     // ==========================================
-    // Public Facing APIs 
+    // Public Facing APIs
     // ==========================================
 
-    /**
-     * 设置用户权益状态变化监听器。
-     * 
-     * 当用户的订阅状态或购买记录发生变化时，会通过此监听器通知。
-     * 建议在应用启动时设置，以实时响应用户权益变化。
-     * 
-     * @param listener 权益状态变化监听器，传 null 可取消监听
-     * 
-     * 使用示例：
-     * ```kotlin
-     * PayKit.shared.setUpdatedCustomerInfoListener(object : UpdatedCustomerInfoListener {
-     *     override fun onReceived(customerInfo: CustomerInfo) {
-     *         // 更新 UI，显示 VIP 状态等
-     *     }
-     * })
-     * ```
-     */
     fun setUpdatedCustomerInfoListener(listener: UpdatedCustomerInfoListener?) {
         this.updateListener = listener
     }
 
     /**
-     * 获取当前用户的权益信息。
-     * 
-     * 此方法会：
-     * 1. 查询 Google Play 的购买记录
-     * 2. 确认未完成的订单
-     * 3. 返回最新的权益状态
-     * 
-     * 建议在以下场景调用：
-     * - 应用启动时检查用户权益
-     * - 进入付费功能页面时验证权限
-     * - 用户点击"恢复购买"按钮时
-     * 
-     * @return 用户权益信息，如果查询失败则返回 null
-     * 
-     * 使用示例：
-     * ```kotlin
-     * viewModelScope.launch {
-     *     val customerInfo = PayKit.shared.getCustomerInfo()
-     *     if (customerInfo != null) {
-     *         val isVip = customerInfo.activeSubscriptions.contains("sub_monthly")
-     *         // 根据权益状态更新 UI
-     *     }
-     * }
-     * ```
+     * 获取用户权益。
+     *
+     * @param forceSync `true`（默认）时向 Google 同步后再返回；`false` 仅读本地缓存（可能为 null）
      */
-    suspend fun getCustomerInfo(): CustomerInfo? = withContext(Dispatchers.IO) {
-        return@withContext syncPurchases()
+    suspend fun getCustomerInfo(forceSync: Boolean = true): CustomerInfo? =
+        withContext(Dispatchers.IO) {
+            if (!forceSync) {
+                return@withContext deviceCache.getCachedCustomerInfo()
+            }
+            return@withContext syncPurchasesInternal().getOrElse { error ->
+                LogUtil.e("getCustomerInfo syncFail msg=${error.message}")
+                deviceCache.getCachedCustomerInfo()
+            }
+        }
+
+    /**
+     * 同步购买记录（补单 / 刷新权益）。
+     *
+     * 适合：应用启动后主动刷新、支付 PENDING 之后再查、诊断掉单。
+     * Google 无独立「恢复」API，本方法即向商店重新查询并更新本地状态。
+     */
+    suspend fun syncPurchases(): Result<CustomerInfo> = withContext(Dispatchers.IO) {
+        syncPurchasesInternal()
+    }
+
+    /**
+     * 恢复购买。
+     *
+     * 产品语义上的「恢复购买」按钮应调用本方法；实现与 [syncPurchases] 相同。
+     * 可找回：当前有效订阅、未消耗的非消耗品 / 未 consume 的消耗品。
+     * 已消耗的消耗型商品无法通过恢复买回。
+     */
+    suspend fun restorePurchases(): Result<CustomerInfo> = syncPurchases()
+
+    /**
+     * 当前待确认订单（会先 [syncPurchases]）。
+     */
+    suspend fun getPendingPurchases(): List<StoreTransaction> =
+        getCustomerInfo(forceSync = true)?.pendingPurchases.orEmpty()
+
+    /**
+     * 本地合并后的购买历史（会先同步商店当前购买，再与缓存合并）。
+     */
+    suspend fun getPurchaseHistory(): List<StoreTransaction> =
+        getCustomerInfo(forceSync = true)?.allPurchaseRecords.orEmpty()
+
+    /**
+     * 从本地缓存按 purchaseToken 查找交易（不同步商店）。
+     */
+    fun findTransaction(purchaseToken: String): StoreTransaction? {
+        return deviceCache.getCachedCustomerInfo()
+            ?.allPurchaseRecords
+            ?.find { it.purchaseToken == purchaseToken }
     }
 
     /**
      * 查询指定商品 ID 的详细信息。
-     * 
-     * 根据配置自动识别商品类型（订阅/消耗型/非消耗型），
-     * 并返回包含价格、标题、描述等完整信息的商品列表。
-     * 
-     * @param productIds 要查询的商品 ID 集合
-     * @return 查询结果，成功时包含商品列表，失败时包含错误信息
-     * 
-     * 使用示例：
-     * ```kotlin
-     * viewModelScope.launch {
-     *     val result = PayKit.shared.getProducts(setOf("sub_monthly", "coins_100"))
-     *     result.onSuccess { products ->
-     *         products.forEach { product ->
-     *             Log.d("PayKit", "${product.productId}: ${product.price}")
-     *         }
-     *     }.onFailure { error ->
-     *         Log.e("PayKit", "查询失败: ${error.message}")
-     *     }
-     * }
-     * ```
      */
     suspend fun getProducts(productIds: Set<String>): Result<List<StoreProduct>> =
         withContext(Dispatchers.IO) {
-            // 根据配置将商品 ID 分为订阅商品和一次性商品两类
             val subsIds = productIds.filter { configuration.subsProductIds.contains(it) }
             val inappIds = productIds.filter {
                 configuration.consumableProductIds.contains(it) ||
@@ -228,7 +262,6 @@ class PayKit private constructor(
 
             val allProducts = mutableListOf<StoreProduct>()
 
-            // 分别查询订阅商品和一次性商品
             if (subsIds.isNotEmpty()) {
                 val subsResult = billingWrapper.queryProductDetailsAsync(
                     ProductType.SUBS,
@@ -255,59 +288,45 @@ class PayKit private constructor(
         }
 
     /**
-     * 发起支付流程。
-     * 
-     * 此方法会：
-     * 1. 启动 Google Play 支付界面
-     * 2. 等待用户完成支付
-     * 3. 通过回调通知支付结果
-     * 
-     * 注意：
-     * - 支付成功后，SDK 会自动确认订单
-     * - 订阅商品需要提供 subscriptionToken
-     * - 支付结果通过 [PurchaseCallback] 返回
-     * 
-     * @param activity 当前 Activity，用于启动支付界面
-     * @param storeProduct 要购买的商品信息
-     * @param callback 支付结果回调
-     * 
-     * 使用示例：
-     * ```kotlin
-     * PayKit.shared.purchase(activity, product, object : PurchaseCallback {
-     *     override fun onCompleted(transaction: StoreTransaction, customerInfo: CustomerInfo) {
-     *         Log.d("PayKit", "支付成功: ${transaction.orderId}")
-     *         // 发放权益
-     *     }
+     * 发起支付。
      *
-     *     override fun onError(error: PayKitError, userCancelled: Boolean) {
-     *         if (userCancelled) {
-     *             Log.d("PayKit", "用户取消")
-     *         } else {
-     *             Log.e("PayKit", "支付失败: ${error.message}")
-     *         }
-     *     }
-     * })
-     * ```
+     * 回调（[PurchaseCallback]）一律在**主线程**投递。
+     *
+     * @param isOfferPersonalized 是否披露个性化价格（欧盟消费者保护要求）。
+     * 默认取 [PayKitConfiguration.isOfferPersonalizedDefault]。
      */
     fun purchase(
-        activity: WeakReference<Activity>,
+        activity: Activity,
         storeProduct: StoreProduct,
-        callback: PurchaseCallback
+        callback: PurchaseCallback,
+        isOfferPersonalized: Boolean = configuration.isOfferPersonalizedDefault
     ) {
         this.activePurchaseCallback = callback
+        LogUtil.d(
+            "purchase start productId=${storeProduct.productId} type=${storeProduct.type} " +
+                "personalized=$isOfferPersonalized"
+        )
 
         applicationScope.launch {
-            val result = billingWrapper.makePurchaseAsync(activity, storeProduct)
+            val result = billingWrapper.makePurchaseAsync(
+                WeakReference(activity),
+                storeProduct,
+                isOfferPersonalized
+            )
             result.onFailure { error ->
-                // 启动购买流程失败
-                this@PayKit.activePurchaseCallback?.onError(
-                    PayKitError(
-                        ErrorCode.STORE_PROBLEM,
-                        error.message ?: "Unknown error"
-                    ),
-                    false
+                LogUtil.e(
+                    "purchase launchFail productId=${storeProduct.productId} msg=${error.message}"
                 )
-                this@PayKit.activePurchaseCallback = null
+                dispatchPurchaseCallback { cb ->
+                    cb.onError(
+                        error as? PayKitError
+                            ?: PayKitError(
+                                ErrorCode.STORE_PROBLEM,
+                                error.message ?: "Unknown error"
+                            ),
+                        false
+                    )
+                }
             }
         }
     }
@@ -316,21 +335,72 @@ class PayKit private constructor(
     // Implements PayKitPurchasesUpdatedListener
     // ==========================================
     override fun onPurchasesUpdated(successfulPurchases: List<StoreTransaction>) {
-        // 由于有单笔回调，走一波完全同步
         applicationScope.launch {
-            val latestInfo = syncPurchases()
-            val callback = activePurchaseCallback
+            val syncResult = syncPurchasesInternal()
+            val latestInfo = syncResult.getOrNull()
+            if (activePurchaseCallback == null) return@launch
 
-            if (callback != null && successfulPurchases.isNotEmpty() && latestInfo != null) {
-                callback.onCompleted(successfulPurchases.first(), latestInfo)
-                activePurchaseCallback = null
+            val purchased = successfulPurchases.filter {
+                it.purchaseState == PurchaseState.PURCHASED
+            }
+            if (purchased.isNotEmpty()) {
+                if (latestInfo != null) {
+                    LogUtil.d(
+                        "purchase completed orderId=${purchased.first().orderId} " +
+                            "products=${purchased.first().productIds}"
+                    )
+                    dispatchPurchaseCallback { cb ->
+                        cb.onCompleted(purchased.first(), latestInfo)
+                    }
+                } else {
+                    val error = syncResult.exceptionOrNull() as? PayKitError
+                        ?: PayKitError(
+                            ErrorCode.STORE_PROBLEM,
+                            syncResult.exceptionOrNull()?.message
+                                ?: "Sync failed after purchase"
+                        )
+                    LogUtil.e(
+                        "purchase syncFailAfterPay orderId=${purchased.first().orderId} " +
+                            "code=${error.code} msg=${error.message}"
+                    )
+                    dispatchPurchaseCallback { cb ->
+                        cb.onError(error, userCancelled = false)
+                    }
+                }
+                return@launch
+            }
+
+            val pending = successfulPurchases.filter {
+                it.purchaseState == PurchaseState.PENDING
+            }
+            if (pending.isNotEmpty()) {
+                LogUtil.d(
+                    "purchase pending orderId=${pending.first().orderId} " +
+                        "products=${pending.first().productIds}"
+                )
+                dispatchPurchaseCallback { cb ->
+                    cb.onPending(pending.first())
+                }
+                return@launch
+            }
+
+            LogUtil.e("purchase updateEmpty count=${successfulPurchases.size}")
+            dispatchPurchaseCallback { cb ->
+                cb.onError(
+                    PayKitError(ErrorCode.UNKNOWN, "No purchased transaction in update"),
+                    userCancelled = false
+                )
             }
         }
     }
 
     override fun onPurchasesFailedToUpdate(error: PayKitError, userCancelled: Boolean) {
-        activePurchaseCallback?.onError(error, userCancelled)
-        activePurchaseCallback = null
+        LogUtil.e(
+            "purchase failed code=${error.code} cancelled=$userCancelled msg=${error.message}"
+        )
+        dispatchPurchaseCallback { cb ->
+            cb.onError(error, userCancelled)
+        }
     }
 
     companion object {

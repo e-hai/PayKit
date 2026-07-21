@@ -66,17 +66,19 @@ abstract class BillingAbstract {
 
     /**
      * 启动购买流程。
-     * 
+     *
      * 此方法会启动支付界面，但不会等待支付完成。
      * 支付结果通过 [PayKitPurchasesUpdatedListener] 返回。
-     * 
+     *
      * @param activity 当前 Activity
      * @param storeProduct 要购买的商品
+     * @param isOfferPersonalized 是否向用户披露价格经个性化（欧盟要求）；默认 false
      * @return 启动结果，成功表示界面已显示，失败表示启动失败
      */
     abstract suspend fun makePurchaseAsync(
         activity: WeakReference<Activity>,
-        storeProduct: StoreProduct
+        storeProduct: StoreProduct,
+        isOfferPersonalized: Boolean = false
     ): Result<Unit>
 
     /**

@@ -7,7 +7,6 @@ import android.widget.Toast
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.kit.pay.PayKit
-import com.kit.pay.interfaces.InitializationCallback
 import com.kit.pay.interfaces.PayKitError
 import com.kit.pay.interfaces.PurchaseCallback
 import com.kit.pay.interfaces.UpdatedCustomerInfoListener
@@ -16,20 +15,19 @@ import com.kit.pay.models.PayKitConfiguration
 import com.kit.pay.models.ProductType
 import com.kit.pay.models.StoreProduct
 import com.kit.pay.models.StoreTransaction
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import java.lang.ref.WeakReference
 
-class MainViewModel(private val app: Application) : AndroidViewModel(app) {
+class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     sealed class UiState {
-        object Loading : UiState()
-        object IsVip : UiState()
-        object IsNotVip : UiState()
+        data object Loading : UiState()
+        data object Ready : UiState()
     }
 
     data class ProductItem(
@@ -40,17 +38,26 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         val errorMessage: String? = null
     )
 
+    data class EntitlementUi(
+        /** 档位优先级：Free < Plus < Pro */
+        val tier: Tier = Tier.Free,
+        val activeSubs: Set<String> = emptySet(),
+        val nonConsumables: Set<String> = emptySet(),
+        val pendingCount: Int = 0
+    ) {
+        val isPaid: Boolean get() = tier != Tier.Free
+    }
+
+    enum class Tier { Free, Plus, Pro }
+
     private val _uiState = MutableStateFlow<UiState>(UiState.Loading)
-    val uiState = _uiState.asStateFlow()
+    val uiState: StateFlow<UiState> = _uiState.asStateFlow()
 
-    private val _errorMessages = MutableSharedFlow<String>()
+    private val _entitlement = MutableStateFlow(EntitlementUi())
+    val entitlement: StateFlow<EntitlementUi> = _entitlement.asStateFlow()
+
+    private val _errorMessages = MutableSharedFlow<String>(extraBufferCapacity = 1)
     val errorMessages = _errorMessages.asSharedFlow()
-
-    private val _isSubscriber = MutableSharedFlow<Boolean>()
-    val isSubscriber = _isSubscriber.asSharedFlow()
-
-    private val _productList = MutableStateFlow<List<StoreProduct>>(emptyList())
-    val productList = _productList.asStateFlow()
 
     private val _subsProducts = MutableStateFlow<List<ProductItem>>(emptyList())
     val subsProducts: StateFlow<List<ProductItem>> = _subsProducts.asStateFlow()
@@ -61,168 +68,215 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     private val _nonConsumableProducts = MutableStateFlow<List<ProductItem>>(emptyList())
     val nonConsumableProducts: StateFlow<List<ProductItem>> = _nonConsumableProducts.asStateFlow()
 
-    fun init() {
-        val configuration = PayKitConfiguration(
-            subsProductIds = setOf(Constants.SUBS_PRODUCT_MONTH, Constants.SUBS_PRODUCT_YEAR),
-            consumableProductIds = setOf(Constants.OTP_GAME_SKIN_3DAY),
-            nonConsumableProductIds = setOf(Constants.OTP_GAME_SKIN_PERMANENT)
-        )
+    private val _querying = MutableStateFlow(false)
+    val querying: StateFlow<Boolean> = _querying.asStateFlow()
 
-        PayKit.configure(app, configuration)
+    fun init() {
+        PayKit.configure(
+            getApplication(),
+            PayKitConfiguration(
+                subsProductIds = Constants.ALL_SUBS_IDS,
+                consumableProductIds = Constants.ALL_CONSUMABLE_IDS,
+                nonConsumableProductIds = Constants.ALL_NON_CONSUMABLE_IDS
+            )
+        )
 
         PayKit.shared.setUpdatedCustomerInfoListener(object : UpdatedCustomerInfoListener {
             override fun onReceived(customerInfo: CustomerInfo) {
-                Log.d(TAG, "收到权益状态自动更新回调！")
-                updateUiWithCustomerInfo(customerInfo)
+                Log.d(TAG, "customerInfo updated pending=${customerInfo.pendingPurchases.size}")
+                applyCustomerInfo(customerInfo)
             }
         })
 
-        // 在 Configure 之后，可以主动随时拉取一次当前状态（类似 RC 的机制）
-        // 如果 SDK 后台此时已经刷完数据，就会走内存/闪电查询；如果还没，则会等待初始化。
         viewModelScope.launch {
-            val customerInfo = PayKit.shared.getCustomerInfo()
-            if (null == customerInfo) {
-                Log.e(TAG, "PayKit 获取异常网络警告：")
+            // 秒开：只读本地缓存。商店同步由 SDK 连接成功后自动 sync，经 Listener 回推，避免双查。
+            val cached = PayKit.shared.getCustomerInfo(forceSync = false)
+            if (cached != null) {
+                applyCustomerInfo(cached)
             } else {
-                Log.d(TAG, "PayKit getCustomerInfo 确认获取环境完毕!")
+                Log.d(TAG, "no cache, wait for auto sync via listener")
+            }
 
-                updateUiWithCustomerInfo(customerInfo)
+            // 连接/同步失败时 Listener 可能永远不来：超时进入主页，可手动「恢复购买」
+            delay(8_000)
+            if (_uiState.value is UiState.Loading) {
+                Log.w(TAG, "auto sync timeout, enter Ready for manual restore")
+                _uiState.value = UiState.Ready
+                showError("尚未同步到权益，可点击「恢复购买」重试")
             }
         }
     }
 
-    private fun updateUiWithCustomerInfo(info: CustomerInfo) {
-        val isVip = info.activeSubscriptions.contains(Constants.SUBS_PRODUCT_MONTH) ||
-                info.activeSubscriptions.contains(Constants.SUBS_PRODUCT_YEAR)
-        viewModelScope.launch {
-            _isSubscriber.emit(isVip)
-            _uiState.value = if (isVip) UiState.IsVip else UiState.IsNotVip
+    private fun applyCustomerInfo(info: CustomerInfo) {
+        val tier = when {
+            Constants.SUBS_PRO in info.activeSubscriptions -> Tier.Pro
+            Constants.SUBS_PLUS in info.activeSubscriptions -> Tier.Plus
+            else -> Tier.Free
         }
-    }
-
-    fun actionLoadSubProductList() {
-        val productIds = setOf(
-            Constants.SUBS_PRODUCT_MONTH,
-            Constants.SUBS_PRODUCT_YEAR
+        _entitlement.value = EntitlementUi(
+            tier = tier,
+            activeSubs = info.activeSubscriptions,
+            nonConsumables = info.nonConsumablePurchases,
+            pendingCount = info.pendingPurchases.size
         )
-        viewModelScope.launch {
-            try {
-                val result = PayKit.shared.getProducts(productIds)
-                result.onSuccess { storeProducts ->
-                    _productList.value = storeProducts
-                }.onFailure { error ->
-                    showError("查询商品失败：${error.message}")
-                }
-            } catch (e: Exception) {
-                showError("查询商品失败：${e.message}")
-            }
-        }
+        _uiState.value = UiState.Ready
     }
 
-    fun actionRecoverUnfinishedOrders() {
-        Log.d(TAG, "开始恢复未完成订单... 对于 RC 架构，只需要调用一次 getCustomerInfo")
-
-        viewModelScope.launch {
-            val customerInfo = PayKit.shared.getCustomerInfo()
-            if (null == customerInfo) {
-                showError("同步失败：")
-
-            } else {
-                showToast("同步完成")
-            }
-        }
-    }
-
-    fun querySubsProducts(activity: Activity) {
-        val products = listOf(
-            Constants.SUBS_PRODUCT_MONTH to ProductType.SUBS,
-            Constants.SUBS_PRODUCT_YEAR to ProductType.SUBS
+    fun querySubsProducts() {
+        // 一个 product 对应一个付费档；每条 StoreProduct 对应一个 base plan × offer 组合
+        queryProductsByType(
+            products = listOf(
+                Constants.SUBS_PLUS to ProductType.SUBS,
+                Constants.SUBS_PRO to ProductType.SUBS
+            ),
+            stateFlow = _subsProducts
         )
-        queryProductsByType(products, _subsProducts, "订阅商品")
     }
 
-    fun queryConsumableProducts(activity: Activity) {
-        val products = listOf(
-            Constants.OTP_GAME_SKIN_3DAY to ProductType.INAPP
+    fun queryConsumableProducts() {
+        queryProductsByType(
+            products = listOf(Constants.OTP_GAME_SKIN_3DAY to ProductType.INAPP),
+            stateFlow = _consumableProducts
         )
-        queryProductsByType(products, _consumableProducts, "消耗商品")
     }
 
-    fun queryNonConsumableProducts(activity: Activity) {
-        val products = listOf(
-            Constants.OTP_GAME_SKIN_PERMANENT to ProductType.INAPP
+    fun queryNonConsumableProducts() {
+        queryProductsByType(
+            products = listOf(Constants.OTP_GAME_SKIN_PERMANENT to ProductType.INAPP),
+            stateFlow = _nonConsumableProducts
         )
-        queryProductsByType(products, _nonConsumableProducts, "非消耗商品")
     }
 
     private fun queryProductsByType(
         products: List<Pair<String, ProductType>>,
-        stateFlow: MutableStateFlow<List<ProductItem>>,
-        typeName: String
+        stateFlow: MutableStateFlow<List<ProductItem>>
     ) {
         viewModelScope.launch {
+            _querying.value = true
             val productIds = products.map { it.first }.toSet()
-
             try {
-                val result = PayKit.shared.getProducts(productIds)
-                result.onSuccess { storeProducts ->
-                    val fetchedIds = storeProducts.map { it.productId }.toSet()
-                    val successItems = storeProducts.map { product ->
-                        ProductItem(product, product.productId, product.type, true)
-                    }
-                    val failedItems = products
-                        .filter { (productId, _) -> productId !in fetchedIds }
-                        .map { (productId, productType) ->
-                            ProductItem(null, productId, productType, false, "未找到商品")
+                PayKit.shared.getProducts(productIds)
+                    .onSuccess { storeProducts ->
+                        val fetchedIds = storeProducts.map { it.productId }.toSet()
+                        // 每个 StoreProduct 已带对应 offerToken，列表里可直接购买
+                        val successItems = storeProducts.map { product ->
+                            ProductItem(product, product.productId, product.type, true)
                         }
-                    stateFlow.value = successItems + failedItems
-                }.onFailure { error ->
-                    stateFlow.value = products.map { (productId, productType) ->
-                        ProductItem(
-                            null,
-                            productId,
-                            productType,
-                            false,
-                            "查询异常：${error.message}"
-                        )
+                        val failedItems = products
+                            .filter { (id, _) -> id !in fetchedIds }
+                            .map { (id, type) ->
+                                ProductItem(null, id, type, false, "未找到商品")
+                            }
+                        stateFlow.value = successItems + failedItems
+                        if (successItems.isEmpty()) {
+                            showToast("未查到商品，请检查 Play Console 配置")
+                        } else {
+                            showToast("查询成功：${successItems.size} 个商品/优惠")
+                        }
                     }
-                }
+                    .onFailure { error ->
+                        stateFlow.value = products.map { (id, type) ->
+                            ProductItem(null, id, type, false, error.message)
+                        }
+                        showError("查询失败：${error.message}")
+                    }
             } catch (e: Exception) {
-                stateFlow.value = products.map { (productId, productType) ->
-                    ProductItem(null, productId, productType, false, "查询异常：${e.message}")
+                stateFlow.value = products.map { (id, type) ->
+                    ProductItem(null, id, type, false, e.message)
+                }
+                showError("查询异常：${e.message}")
+            } finally {
+                _querying.value = false
+            }
+        }
+    }
+
+    fun restorePurchases() {
+        showToast("正在恢复购买…")
+        viewModelScope.launch {
+            PayKit.shared.restorePurchases()
+                .onSuccess { info ->
+                    applyCustomerInfo(info)
+                    val pending = info.pendingPurchases.size
+                    showToast(
+                        if (pending > 0) "恢复完成，待确认订单 $pending 笔"
+                        else "恢复完成"
+                    )
+                }
+                .onFailure { error ->
+                    showError("恢复失败：${error.message}")
+                }
+        }
+    }
+
+    fun checkEntitlements() {
+        viewModelScope.launch {
+            val info = PayKit.shared.getCustomerInfo(forceSync = true)
+            if (info == null) {
+                showToast("检查失败")
+                return@launch
+            }
+            applyCustomerInfo(info)
+            showToast(
+                "档位=${_entitlement.value.tier} " +
+                    "订阅=${info.activeSubscriptions.size} " +
+                    "非消耗=${info.nonConsumablePurchases.size} " +
+                    "待确认=${info.pendingPurchases.size}"
+            )
+        }
+    }
+
+    /**
+     * 优先用列表里已有的 [StoreProduct] 购买（含正确 offerToken），避免二次查询与错误匹配。
+     */
+    fun purchase(activity: Activity, item: ProductItem) {
+        val product = item.product
+        if (product == null) {
+            showError("商品不可用：${item.productId}")
+            return
+        }
+        purchaseStoreProduct(activity, product)
+    }
+
+    fun purchaseStoreProduct(activity: Activity, product: StoreProduct) {
+        Log.d(
+            TAG,
+            "purchase productId=${product.productId} type=${product.type} " +
+                "hasOfferToken=${!product.subscriptionToken.isNullOrEmpty()}"
+        )
+        PayKit.shared.purchase(activity, product, object : PurchaseCallback {
+            override fun onCompleted(
+                storeTransaction: StoreTransaction,
+                customerInfo: CustomerInfo
+            ) {
+                Log.d(TAG, "purchase completed orderId=${storeTransaction.orderId}")
+                applyCustomerInfo(customerInfo)
+                showToast("支付成功 ${storeTransaction.orderId}")
+            }
+
+            override fun onPending(storeTransaction: StoreTransaction) {
+                Log.d(TAG, "purchase pending orderId=${storeTransaction.orderId}")
+                showToast("支付待确认，完成后将自动到账")
+                // 同步一下以便 pending 出现在权益视图
+                viewModelScope.launch {
+                    PayKit.shared.getCustomerInfo(forceSync = true)?.let { applyCustomerInfo(it) }
                 }
             }
-        }
-    }
 
-    fun recoverOrdersWithToast() {
-        actionRecoverUnfinishedOrders()
-        showToast("正在恢复订单...")
-    }
-
-    fun checkEntitlementsWithToast() {
-        viewModelScope.launch {
-            val customerInfo = PayKit.shared.getCustomerInfo()
-            if (customerInfo != null) {
-                val isVip =
-                    customerInfo.activeSubscriptions.contains(Constants.SUBS_PRODUCT_MONTH) ||
-                            customerInfo.activeSubscriptions.contains(Constants.SUBS_PRODUCT_YEAR)
-                showToast("当前是否有权益: $isVip")
-            } else {
-                showToast("检查失败：")
+            override fun onError(error: PayKitError, userCancelled: Boolean) {
+                if (userCancelled) {
+                    Log.d(TAG, "purchase cancelled")
+                    showToast("已取消支付")
+                } else {
+                    Log.e(TAG, "purchase error code=${error.code} msg=${error.message}")
+                    showError("支付失败：${error.message} (${error.code})")
+                }
             }
-        }
-    }
-
-
-    fun purchaseProduct(activity: WeakReference<Activity>, productId: String, offerId: String = "") {
-        actionPurchase(activity, productId, offerId)
+        })
     }
 
     private fun showToast(message: String) {
-        viewModelScope.launch {
-            Toast.makeText(getApplication(), message, Toast.LENGTH_SHORT).show()
-        }
+        Toast.makeText(getApplication(), message, Toast.LENGTH_SHORT).show()
     }
 
     private fun showError(message: String) {
@@ -231,52 +285,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /**基于 Callback 发起支付**/
-    fun actionPurchase(activity: WeakReference<Activity>, productId: String, offerId: String = "") {
-        // 由于 RevenueCat 需要 StoreProduct 对象，我们这里粗略先查一下然后再买。
-        // （如果在你的 UI 层已经有了 StoreProduct 对象，可以直接传进来，节省这一次查询）。
-        viewModelScope.launch {
-            try {
-                val result = PayKit.shared.getProducts(setOf(productId))
-                result.onSuccess { storeProducts ->
-                    // 如果传入了特有 offerId 尝试找出对应那个 token 的 sku
-                    val targetProduct = storeProducts.find {
-                        it.productId == productId && it.subscriptionToken?.contains(offerId) ?: true
-                    }
-                    val productToBuy = targetProduct ?: storeProducts.firstOrNull()
-
-                    if (productToBuy != null) {
-                        PayKit.shared.purchase(activity, productToBuy, object : PurchaseCallback {
-                            override fun onCompleted(
-                                storeTransaction: StoreTransaction,
-                                customerInfo: CustomerInfo
-                            ) {
-                                Log.d(TAG, "支付成功！订单号: ${storeTransaction.orderId}")
-                                showToast("支付成功")
-                            }
-
-                            override fun onError(error: PayKitError, userCancelled: Boolean) {
-                                if (userCancelled) {
-                                    Log.d(TAG, "用户主动取消了支付")
-                                } else {
-                                    Log.e(TAG, "支付报错: ${error.message} - code: ${error.code}")
-                                    showError("支付异常：${error.message} (${error.code})")
-                                }
-                            }
-                        })
-                    } else {
-                        showError("找不对此商品，无法购买")
-                    }
-                }.onFailure { error ->
-                    showError("拉取发货参数失败：${error.message}")
-                }
-            } catch (e: Exception) {
-                showError("拉取发货参数失败：${e.message}")
-            }
-        }
-    }
-
     companion object {
-        const val TAG = "MainViewModel"
+        const val TAG = "PayKit-Sample"
     }
 }

@@ -1,224 +1,137 @@
 package com.kit.pay.sample
 
-import android.app.Activity
 import android.os.Bundle
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
-import com.kit.pay.models.ProductType
-import com.kit.pay.models.StoreProduct
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
-import java.lang.ref.WeakReference
 
 /**
- * 主 Activity（使用 Compose 实现所有页面）
- * 
- * 功能：
- * 1. 开屏页 - 显示品牌标识和加载动画
- * 2. 初始化支付 SDK
- * 3. 恢复未完成订单
- * 4. 检查 VIP 状态
- * 5. 根据 VIP 状态显示不同的主页面
+ * PayKit Demo：初始化 SDK、查询商品、购买、恢复购买、查看权益。
  */
 class MainActivity : ComponentActivity() {
 
     private val mainViewModel by viewModels<MainViewModel>()
-    
+
     override fun onCreate(savedInstanceState: Bundle?) {
-        // 安装启动屏（Android 12+）
         installSplashScreen()
-        
-        // 启用全面屏
         enableEdgeToEdge()
-        
         super.onCreate(savedInstanceState)
-        
-        // 初始化 SDK 并监听 VIP 状态
-        initSdkAndObserveVipStatus()
-        
-        // 监听错误信息
-        observeErrorMessages()
-        
-        // 设置 Compose UI
+
+        mainViewModel.init()
+        observeErrors()
+
         setContent {
             MaterialTheme(
                 colorScheme = lightColorScheme(
-                    primary = Color(0xFF6200EE),
-                    secondary = Color(0xFF03DAC6),
-                    background = Color(0xFFFFFBFE),
-                    surface = Color(0xFFFFFBFE),
+                    primary = Color(0xFF4F46E5),
+                    secondary = Color(0xFF0D9488),
+                    background = Color(0xFFF8FAFC),
+                    surface = Color.White,
                     onPrimary = Color.White,
-                    onSecondary = Color.Black,
-                    onBackground = Color.Black,
-                    onSurface = Color.Black
+                    onSecondary = Color.White,
+                    onBackground = Color(0xFF0F172A),
+                    onSurface = Color(0xFF0F172A)
                 )
             ) {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background
-                ) {
-                    // 收集 ViewModel 中的 UI 状态
+                Surface(modifier = Modifier.fillMaxSize()) {
                     val uiState by mainViewModel.uiState.collectAsState()
-                    val productList by mainViewModel.productList.collectAsState()
-                    // UI state collectors
+                    val entitlement by mainViewModel.entitlement.collectAsState()
                     val subsProducts by mainViewModel.subsProducts.collectAsState()
                     val consumableProducts by mainViewModel.consumableProducts.collectAsState()
                     val nonConsumableProducts by mainViewModel.nonConsumableProducts.collectAsState()
-                    
-                    when (val state = uiState) {
+                    val querying by mainViewModel.querying.collectAsState()
+
+                    when (uiState) {
                         is MainViewModel.UiState.Loading -> SplashScreenContent()
-                        is MainViewModel.UiState.IsVip -> MainContent(
-                            isVip = true,
+                        is MainViewModel.UiState.Ready -> MainContent(
+                            entitlement = entitlement,
+                            querying = querying,
                             subsProducts = subsProducts,
                             consumableProducts = consumableProducts,
                             nonConsumableProducts = nonConsumableProducts,
-                            onPurchaseClick = { productId, offerId ->
-                                // 直接调用购买函数，传入当前 Activity
-                                mainViewModel.purchaseProduct(WeakReference(this@MainActivity as Activity), productId, offerId)
+                            onPurchase = { item ->
+                                mainViewModel.purchase(this@MainActivity, item)
                             },
-                            onFeatureClick = { action ->
-                                // 根据 action 直接调用对应函数
-                                when (action) {
-                                    "query_products" -> Log.d(TAG, "Not implemented in current UI flow")
-                                    "recover_orders" -> mainViewModel.recoverOrdersWithToast()
-                                    "manage_entitlements" -> mainViewModel.checkEntitlementsWithToast()
-                                    else -> Log.w(TAG, "未知功能：$action")
-                                }
-                            },
-                            onQuerySubsClick = {
-                                mainViewModel.querySubsProducts(this@MainActivity)
-                            },
-                            onQueryConsumableClick = {
-                                mainViewModel.queryConsumableProducts(this@MainActivity)
-                            },
-                            onQueryNonConsumableClick = {
-                                mainViewModel.queryNonConsumableProducts(this@MainActivity)
-                            }
-                        )
-                        is MainViewModel.UiState.IsNotVip -> MainContent(
-                            isVip = false,
-                            subsProducts = subsProducts,
-                            consumableProducts = consumableProducts,
-                            nonConsumableProducts = nonConsumableProducts,
-                            onPurchaseClick = { productId, offerId ->
-                                // 直接调用购买函数，传入当前 Activity
-                                mainViewModel.purchaseProduct(WeakReference(this@MainActivity), productId, offerId)
-                            },
-                            onFeatureClick = { action ->
-                                // 根据 action 直接调用对应函数
-                                when (action) {
-                                    "query_products" -> Log.d(TAG, "Not implemented in current UI flow")
-                                    "recover_orders" -> mainViewModel.recoverOrdersWithToast()
-                                    "manage_entitlements" -> mainViewModel.checkEntitlementsWithToast()
-                                    else -> Log.w(TAG, "未知功能：$action")
-                                }
-                            },
-                            onQuerySubsClick = {
-                                mainViewModel.querySubsProducts(this@MainActivity)
-                            },
-                            onQueryConsumableClick = {
-                                mainViewModel.queryConsumableProducts(this@MainActivity)
-                            },
-                            onQueryNonConsumableClick = {
-                                mainViewModel.queryNonConsumableProducts(this@MainActivity)
-                            }
+                            onRestore = { mainViewModel.restorePurchases() },
+                            onCheckEntitlements = { mainViewModel.checkEntitlements() },
+                            onQuerySubs = { mainViewModel.querySubsProducts() },
+                            onQueryConsumable = { mainViewModel.queryConsumableProducts() },
+                            onQueryNonConsumable = { mainViewModel.queryNonConsumableProducts() }
                         )
                     }
                 }
             }
         }
     }
-    
-    /**
-     * 初始化 SDK 并监听 VIP 状态
-     */
-    private fun initSdkAndObserveVipStatus() {
-        lifecycleScope.launch {
-            repeatOnLifecycle(Lifecycle.State.CREATED) {
-                // 收集 VIP 状态变化（用于其他逻辑）
-                launch {
-                    mainViewModel.isSubscriber.collect { isVip ->
-                        Log.d(TAG, "VIP 状态更新：$isVip")
-                    }
-                }
-                
-                // 初始化 SDK（会自动触发订单恢复和 VIP 状态检查）
-                launch {
-                    mainViewModel.init()
-                    
-                    // 等待一段时间确保 SDK 初始化完成
-                    delay(3000)
-                    
-                    // 如果超过 3 秒还没收到 VIP 状态，主动检查一次
-                    if (mainViewModel.uiState.value is MainViewModel.UiState.Loading) {
-                        Log.d(TAG, "SDK 初始化超时，主动检查 VIP 状态")
-                        mainViewModel.checkEntitlementsWithToast()
-                    }
-                }
-            }
-        }
-    }
-    
-    /**
-     * 监听错误信息并显示
-     */
-    private fun observeErrorMessages() {
+
+    private fun observeErrors() {
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
-                mainViewModel.errorMessages.collectLatest { errorMessage ->
-                    Log.e(TAG, "错误：$errorMessage")
-                    // TODO: 这里可以使用 Snackbar 或 Dialog 显示错误
-                    // 目前使用 Toast 简单提示
-                    android.widget.Toast.makeText(
-                        this@MainActivity,
-                        errorMessage,
-                        android.widget.Toast.LENGTH_LONG
-                    ).show()
+                mainViewModel.errorMessages.collectLatest { message ->
+                    Log.e(TAG, "error=$message")
+                    Toast.makeText(this@MainActivity, message, Toast.LENGTH_LONG).show()
                 }
             }
         }
     }
-    
-    override fun onDestroy() {
-        super.onDestroy()
-        // 无需清理 Activity，因为不再持有引用
-    }
-    
+
     companion object {
-        private const val TAG = "MainActivity"
+        private const val TAG = "PayKit-Sample"
     }
 }
 
-/**
- * 开屏页内容
- */
 @Composable
 fun SplashScreenContent() {
     Box(
@@ -226,407 +139,524 @@ fun SplashScreenContent() {
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
-                    colors = listOf(
-                        Color(0xFF6200EE),
-                        Color(0xFF3700B3)
-                    )
+                    listOf(Color(0xFF4F46E5), Color(0xFF312E81))
                 )
             ),
         contentAlignment = Alignment.Center
     ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            // 品牌 Logo（用圆形代替）
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Box(
                 modifier = Modifier
-                    .size(120.dp)
+                    .size(112.dp)
                     .clip(CircleShape)
-                    .background(Color.White.copy(alpha = 0.2f)),
+                    .background(Color.White.copy(alpha = 0.18f)),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
                     text = "Pay",
-                    fontSize = 48.sp,
+                    fontSize = 40.sp,
                     fontWeight = FontWeight.Bold,
                     color = Color.White
                 )
             }
-            
-            Spacer(modifier = Modifier.height(32.dp))
-            
-            // 应用名称
+            Spacer(modifier = Modifier.height(28.dp))
             Text(
-                text = "支付示例",
-                fontSize = 28.sp,
+                text = "PayKit Sample",
+                fontSize = 26.sp,
                 fontWeight = FontWeight.Bold,
                 color = Color.White
             )
-            
             Spacer(modifier = Modifier.height(8.dp))
-            
-            // 副标题
             Text(
-                text = "安全 · 便捷 · 高效",
-                fontSize = 16.sp,
+                text = "查询 · 购买 · 恢复 · 权益",
+                fontSize = 14.sp,
                 color = Color.White.copy(alpha = 0.8f)
             )
-            
-            Spacer(modifier = Modifier.height(48.dp))
-            
-            // 加载指示器
+            Spacer(modifier = Modifier.height(40.dp))
             CircularProgressIndicator(
-                modifier = Modifier.size(40.dp),
+                modifier = Modifier.size(36.dp),
                 color = Color.White,
                 strokeWidth = 3.dp
             )
-            
-            Spacer(modifier = Modifier.height(16.dp))
-            
+            Spacer(modifier = Modifier.height(12.dp))
             Text(
-                text = "正在初始化...",
-                fontSize = 14.sp,
+                text = "正在同步购买记录…",
+                fontSize = 13.sp,
                 color = Color.White.copy(alpha = 0.7f)
             )
         }
     }
 }
 
-/**
- * 主页面内容
- */
 @Composable
 fun MainContent(
-    isVip: Boolean,
-    onPurchaseClick: (String, String) -> Unit = { _, _ -> },
-    onFeatureClick: (String) -> Unit = {},
-    subsProducts: List<MainViewModel.ProductItem> = emptyList(),
-    consumableProducts: List<MainViewModel.ProductItem> = emptyList(),
-    nonConsumableProducts: List<MainViewModel.ProductItem> = emptyList(),
-    onQuerySubsClick: () -> Unit = {},
-    onQueryConsumableClick: () -> Unit = {},
-    onQueryNonConsumableClick: () -> Unit = {}
+    entitlement: MainViewModel.EntitlementUi,
+    querying: Boolean,
+    subsProducts: List<MainViewModel.ProductItem>,
+    consumableProducts: List<MainViewModel.ProductItem>,
+    nonConsumableProducts: List<MainViewModel.ProductItem>,
+    onPurchase: (MainViewModel.ProductItem) -> Unit,
+    onRestore: () -> Unit,
+    onCheckEntitlements: () -> Unit,
+    onQuerySubs: () -> Unit,
+    onQueryConsumable: () -> Unit,
+    onQueryNonConsumable: () -> Unit
 ) {
-    var showProductList by remember { mutableStateOf(false) }
-    
-    Box(
+    LazyColumn(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFFF8F9FA))
+            .background(Color(0xFFF8FAFC))
+            .padding(horizontal = 20.dp, vertical = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        LazyColumn(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 20.dp, vertical = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(20.dp)
-        ) {
-            // 顶部状态栏
+        item {
+            StatusHeader(entitlement = entitlement)
+        }
+
+        item { SectionTitle("查询商品") }
+
+        item {
+            QueryButton(
+                text = if (querying) "查询中…" else "查询订阅商品",
+                enabled = !querying,
+                onClick = onQuerySubs
+            )
+        }
+        if (subsProducts.isNotEmpty()) {
             item {
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(180.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor = if (isVip) {
-                            Color(0xFF10B981)  // 翡翠绿
-                        } else {
-                            Color(0xFF6366F1)  // 靛蓝色
-                        }
-                    ),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 8.dp),
-                    shape = MaterialTheme.shapes.large
-                ) {
-                    Box(
-                        modifier = Modifier.fillMaxSize(),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.Center
-                        ) {
-                            // VIP 图标
-                            Text(
-                                text = if (isVip) "👑" else "✨",
-                                fontSize = 48.sp
-                            )
-                            
-                            Spacer(modifier = Modifier.height(12.dp))
-                            
-                            Text(
-                                text = if (isVip) "VIP 尊贵用户" else "普通会员",
-                                fontSize = 28.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White
-                            )
-                            
-                            Spacer(modifier = Modifier.height(6.dp))
-                            
-                            Text(
-                                text = if (isVip) "感谢支持，享受专属权益" else "升级 VIP，解锁更多功能",
-                                fontSize = 14.sp,
-                                color = Color.White.copy(alpha = 0.9f)
-                            )
-                        }
-                    }
-                }
-            }
-            
-            item {
-                Spacer(modifier = Modifier.height(24.dp))
-            }
-            
-            // 查询商品区域
-            item {
-                SectionTitle(title = "💎 查询商品")
-            }
-            
-            item {
-                // 订阅商品查询按钮
-                QueryButton(
-                    text = "查询订阅商品",
-                    onClick = { onQuerySubsClick() },
-                    icon = "📦"
-                )
-            }
-            
-            item {
-                Spacer(modifier = Modifier.height(8.dp))
-            }
-            
-            item {
-                // 订阅商品横向列表
-                if (subsProducts.isNotEmpty()) {
-                    ProductHorizontalList(
-                        products = subsProducts,
-                        title = "订阅商品",
-                        onPurchaseClick = onPurchaseClick
-                    )
-                }
-            }
-            
-            item {
-                Spacer(modifier = Modifier.height(12.dp))
-            }
-            
-            item {
-                // 消耗商品查询按钮
-                QueryButton(
-                    text = "查询消耗商品",
-                    onClick = { onQueryConsumableClick() },
-                    icon = "⚡"
-                )
-            }
-            
-            item {
-                Spacer(modifier = Modifier.height(8.dp))
-            }
-            
-            item {
-                // 消耗商品横向列表
-                if (consumableProducts.isNotEmpty()) {
-                    ProductHorizontalList(
-                        products = consumableProducts,
-                        title = "消耗商品",
-                        onPurchaseClick = onPurchaseClick
-                    )
-                }
-            }
-            
-            item {
-                Spacer(modifier = Modifier.height(12.dp))
-            }
-            
-            item {
-                // 非消耗商品查询按钮
-                QueryButton(
-                    text = "查询非消耗商品",
-                    onClick = { onQueryNonConsumableClick() },
-                    icon = "🎁"
-                )
-            }
-            
-            item {
-                Spacer(modifier = Modifier.height(8.dp))
-            }
-            
-            item {
-                // 非消耗商品横向列表
-                if (nonConsumableProducts.isNotEmpty()) {
-                    ProductHorizontalList(
-                        products = nonConsumableProducts,
-                        title = "非消耗商品",
-                        onPurchaseClick = onPurchaseClick
-                    )
-                }
-            }
-            
-            // 功能区域
-            item {
-                SectionTitle(title = "⚙️ 管理功能")
-            }
-            
-            item {
-                FeatureButton(
-                    text = "恢复未完成订单",
-                    onClick = { onFeatureClick("recover_orders") },
-                    icon = "🔄",
-                    backgroundColor = Color(0xFF3B82F6)
-                )
-            }
-            
-            item {
-                FeatureButton(
-                    text = "检查权益状态",
-                    onClick = { onFeatureClick("manage_entitlements") },
-                    icon = "✅",
-                    backgroundColor = Color(0xFF8B5CF6)
+                SubscriptionOffersSection(
+                    products = subsProducts,
+                    onPurchase = onPurchase
                 )
             }
         }
+
+        item {
+            QueryButton(
+                text = if (querying) "查询中…" else "查询消耗商品",
+                enabled = !querying,
+                onClick = onQueryConsumable
+            )
+        }
+        if (consumableProducts.isNotEmpty()) {
+            item {
+                ProductHorizontalList(
+                    title = "消耗商品",
+                    products = consumableProducts,
+                    onPurchase = onPurchase
+                )
+            }
+        }
+
+        item {
+            QueryButton(
+                text = if (querying) "查询中…" else "查询非消耗商品",
+                enabled = !querying,
+                onClick = onQueryNonConsumable
+            )
+        }
+        if (nonConsumableProducts.isNotEmpty()) {
+            item {
+                ProductHorizontalList(
+                    title = "非消耗商品",
+                    products = nonConsumableProducts,
+                    onPurchase = onPurchase
+                )
+            }
+        }
+
+        item { SectionTitle("管理") }
+
+        item {
+            FeatureButton(
+                text = "恢复购买",
+                onClick = onRestore,
+                backgroundColor = Color(0xFF2563EB)
+            )
+        }
+        item {
+            FeatureButton(
+                text = "检查权益（强制同步）",
+                onClick = onCheckEntitlements,
+                backgroundColor = Color(0xFF7C3AED)
+            )
+        }
+
+        item { Spacer(modifier = Modifier.height(24.dp)) }
     }
 }
 
-/**
- * 商品卡片组件
- */
 @Composable
-fun ProductCard(
-    product: StoreProduct,
-    isSelected: Boolean = false,
-    onSelect: () -> Unit = {},
-    onPurchase: (String, String) -> Unit = { _, _ -> }
-) {
+private fun StatusHeader(entitlement: MainViewModel.EntitlementUi) {
+    val tier = entitlement.tier
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(168.dp),
         colors = CardDefaults.cardColors(
-            containerColor = if (isSelected) Color(0xFFE3F2FD) else Color.White
+            containerColor = when (tier) {
+                MainViewModel.Tier.Free -> Color(0xFF4F46E5)
+                MainViewModel.Tier.Plus -> Color(0xFF0D9488)
+                MainViewModel.Tier.Pro -> Color(0xFF059669)
+            }
         ),
-        onClick = { onSelect() }
+        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
+        shape = MaterialTheme.shapes.large
     ) {
         Column(
             modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp)
+                .fillMaxSize()
+                .padding(20.dp),
+            verticalArrangement = Arrangement.Center
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Column(
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text(
-                        text = product.title,
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.Black
-                    )
-                    
-                    Spacer(modifier = Modifier.height(4.dp))
-                    
-                    Text(
-                        text = product.description,
-                        fontSize = 12.sp,
-                        color = Color.Gray
-                    )
-                    
-                    Spacer(modifier = Modifier.height(8.dp))
-                    
-                    Text(
-                        text = "类型：${when (product.type) {
-                            ProductType.SUBS -> "订阅商品"
-                            ProductType.INAPP -> "一次性商品"
-                            else -> "未知"
-                        }}",
-                        fontSize = 12.sp,
-                        color = Color.Blue
-                    )
-                }
-                
-                // 购买按钮
-                Button(
-                    onClick = { 
-                        // 默认使用基础方案
-                        val offerId = when {
-                            product.productId.contains("MONTH") -> Constants.BASIC_MONTHLY_PLAN
-                            product.productId.contains("YEAR") -> Constants.BASIC_YEARLY_PLAN
-                            else -> ""
-                        }
-                        onPurchase(product.productId, offerId)
+            Text(
+                text = tier.name,
+                fontSize = 26.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color.White
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = when (tier) {
+                    MainViewModel.Tier.Free -> "免费档 · 升级 Plus 或 Pro 解锁更多权益"
+                    MainViewModel.Tier.Plus -> "已开通 Plus · 可升级至 Pro"
+                    MainViewModel.Tier.Pro -> "已开通 Pro 会员"
+                },
+                fontSize = 14.sp,
+                color = Color.White.copy(alpha = 0.9f)
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = buildString {
+                    append("非消耗 ${entitlement.nonConsumables.size}")
+                    if (entitlement.pendingCount > 0) {
+                        append(" · 待确认 ${entitlement.pendingCount}")
                     }
-                ) {
-                    Text("购买")
-                }
+                },
+                fontSize = 12.sp,
+                color = Color.White.copy(alpha = 0.75f)
+            )
+            if (entitlement.activeSubs.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = entitlement.activeSubs.joinToString(),
+                    fontSize = 12.sp,
+                    color = Color.White.copy(alpha = 0.75f),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
         }
     }
 }
 
 /**
- * 横向滑动商品列表（支持成功和失败状态）
+ * Free + Plus + Pro 模型下的订阅购买区：档位/周期切换，主 CTA 优先试用。
  */
 @Composable
-fun ProductHorizontalList(
+fun SubscriptionOffersSection(
     products: List<MainViewModel.ProductItem>,
-    title: String,
-    onPurchaseClick: (String, String) -> Unit = { _, _ -> }
+    onPurchase: (MainViewModel.ProductItem) -> Unit
 ) {
-    Column(
-        modifier = Modifier.fillMaxWidth()
-    ) {
+    var paidTier by remember(products) { mutableStateOf(PaidTier.Plus) }
+    var selectedBasePlanId by remember(products, paidTier) { mutableStateOf<String?>(null) }
+
+    val availableBasePlanIds = remember(products, paidTier) {
+        products.asSequence()
+            .filter { it.productId == paidTier.productId && it.isSuccess }
+            .mapNotNull { it.product?.basePlanId }
+            .distinct()
+            .sortedBy(::basePlanOrder)
+            .toList()
+    }
+    val activeBasePlanId = selectedBasePlanId
+        ?.takeIf { it in availableBasePlanIds }
+        ?: availableBasePlanIds.firstOrNull()
+    var expanded by remember(products, paidTier, activeBasePlanId) { mutableStateOf(false) }
+
+    val periodOffers = remember(products, paidTier, activeBasePlanId) {
+        products.filter {
+            it.productId == paidTier.productId &&
+                it.isSuccess &&
+                it.product?.basePlanId == activeBasePlanId
+        }
+    }
+    val (primary, others) = remember(periodOffers) { pickPrimaryOffer(periodOffers) }
+
+    Column(modifier = Modifier.fillMaxWidth()) {
         Text(
-            text = "$title (${products.size}个)",
+            text = "选择付费档",
             fontSize = 14.sp,
             fontWeight = FontWeight.SemiBold,
-            color = Color.Black
+            color = Color(0xFF334155)
         )
-        
         Spacer(modifier = Modifier.height(8.dp))
-        
-        // 横向滑动列表
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            PeriodChip(
+                label = "Plus",
+                selected = paidTier == PaidTier.Plus,
+                onClick = { paidTier = PaidTier.Plus },
+                modifier = Modifier.weight(1f)
+            )
+            PeriodChip(
+                label = "Pro",
+                selected = paidTier == PaidTier.Pro,
+                onClick = { paidTier = PaidTier.Pro },
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
         LazyRow(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            items(products.size) { index ->
-                val item = products[index]
-                ProductCardWithStatus(
-                    productItem = item,
-                    onPurchase = { productId, offerId ->
-                        // 如果是成功的商品，发起购买
-                        if (item.isSuccess) {
-                            onPurchaseClick(productId, offerId)
+            items(availableBasePlanIds, key = { it }) { basePlanId ->
+                PeriodChip(
+                    label = basePlanLabel(basePlanId),
+                    selected = basePlanId == activeBasePlanId,
+                    onClick = { selectedBasePlanId = basePlanId },
+                    modifier = Modifier.width(104.dp)
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        if (primary == null) {
+            Text(
+                text = if (availableBasePlanIds.isEmpty()) {
+                    "${paidTier.name} 暂无可用计费周期"
+                } else {
+                    "当前周期暂无可用方案"
+                },
+                fontSize = 13.sp,
+                color = Color(0xFF64748B)
+            )
+        } else {
+            PrimaryOfferCard(
+                item = primary,
+                tier = paidTier,
+                onPurchase = onPurchase
+            )
+
+            if (others.isNotEmpty()) {
+                TextButton(
+                    onClick = { expanded = !expanded },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = if (expanded) {
+                            "收起其他方案"
+                        } else {
+                            "查看其他方案（${others.size}）"
+                        },
+                        fontSize = 14.sp,
+                        color = Color(0xFF4F46E5)
+                    )
+                }
+                if (expanded) {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        others.forEach { item ->
+                            ProductCardWithStatus(
+                                productItem = item,
+                                onPurchase = onPurchase,
+                                compact = true
+                            )
                         }
                     }
+                }
+            }
+        }
+
+        val failed = products.filter { it.productId == paidTier.productId && !it.isSuccess }
+        if (failed.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(8.dp))
+            failed.forEach { item ->
+                Text(
+                    text = "${item.productId}：${item.errorMessage ?: "查询失败"}",
+                    fontSize = 12.sp,
+                    color = Color(0xFFB91C1C)
                 )
             }
         }
     }
 }
 
-/**
- * 带状态的商品卡片（成功/失败）
- */
+private enum class PaidTier(val productId: String) {
+    Plus(Constants.SUBS_PLUS),
+    Pro(Constants.SUBS_PRO)
+}
+
+private fun basePlanLabel(basePlanId: String): String = when (basePlanId) {
+    Constants.PLUS_MONTHLY, Constants.PRO_MONTHLY -> "月付"
+    Constants.PLUS_QUARTERLY -> "季付"
+    Constants.PLUS_YEARLY, Constants.PRO_YEARLY -> "年付"
+    else -> basePlanId
+}
+
+private fun basePlanOrder(basePlanId: String): Int = when (basePlanId) {
+    Constants.PLUS_MONTHLY, Constants.PRO_MONTHLY -> 0
+    Constants.PLUS_QUARTERLY -> 1
+    Constants.PLUS_YEARLY, Constants.PRO_YEARLY -> 2
+    else -> 100
+}
+
+@Composable
+private fun PeriodChip(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Button(
+        onClick = onClick,
+        modifier = modifier.height(44.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (selected) Color(0xFF4F46E5) else Color(0xFFE2E8F0),
+            contentColor = if (selected) Color.White else Color(0xFF334155)
+        ),
+        shape = MaterialTheme.shapes.medium
+    ) {
+        Text(text = label, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+    }
+}
+
+/** 同周期内：优先免费试用 offer，否则取价格最高的默认价。 */
+private fun pickPrimaryOffer(
+    offers: List<MainViewModel.ProductItem>
+): Pair<MainViewModel.ProductItem?, List<MainViewModel.ProductItem>> {
+    if (offers.isEmpty()) return null to emptyList()
+    val trial = offers.firstOrNull { it.product?.hasFreeTrial == true }
+    val primary = trial ?: offers.maxByOrNull { it.product?.priceAmountMicros ?: 0L }!!
+    val others = offers.filterNot { item ->
+        item.productId == primary.productId &&
+            item.product?.subscriptionToken == primary.product?.subscriptionToken
+    }
+    return primary to others
+}
+
+@Composable
+private fun PrimaryOfferCard(
+    item: MainViewModel.ProductItem,
+    tier: PaidTier,
+    onPurchase: (MainViewModel.ProductItem) -> Unit
+) {
+    val product = item.product!!
+    val isTrial = product.hasFreeTrial
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFEEF2FF)),
+        border = BorderStroke(2.dp, Color(0xFF4F46E5)),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                text = if (isTrial) "含免费试用" else "${tier.name} 方案",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFF4F46E5)
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = product.title.ifBlank { item.productId },
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFF0F172A)
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = product.price.ifBlank { "价格未知" },
+                fontSize = 22.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFF4F46E5)
+            )
+            if (!product.basePlanId.isNullOrBlank() || !product.offerId.isNullOrBlank()) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = buildString {
+                        product.basePlanId?.let { append("plan=$it") }
+                        if (!product.basePlanId.isNullOrBlank() && !product.offerId.isNullOrBlank()) {
+                            append(" · ")
+                        }
+                        product.offerId?.let { append("offer=$it") }
+                    },
+                    fontSize = 11.sp,
+                    color = Color(0xFF64748B)
+                )
+            }
+            if (product.description.isNotBlank()) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = product.description,
+                    fontSize = 12.sp,
+                    color = Color(0xFF64748B),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+            Button(
+                onClick = { onPurchase(item) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4F46E5))
+            ) {
+                Text(
+                    text = if (isTrial) "开始 ${tier.name} 免费试用" else "订阅 ${tier.name}",
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun ProductHorizontalList(
+    title: String,
+    products: List<MainViewModel.ProductItem>,
+    onPurchase: (MainViewModel.ProductItem) -> Unit
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(
+            text = "$title（${products.size}）",
+            fontSize = 14.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = Color(0xFF334155)
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            items(products, key = { "${it.productId}-${it.product?.subscriptionToken}" }) { item ->
+                ProductCardWithStatus(productItem = item, onPurchase = onPurchase)
+            }
+        }
+    }
+}
+
 @Composable
 fun ProductCardWithStatus(
     productItem: MainViewModel.ProductItem,
-    onPurchase: (String, String) -> Unit
+    onPurchase: (MainViewModel.ProductItem) -> Unit,
+    compact: Boolean = false
 ) {
+    val product = productItem.product
     Card(
         modifier = Modifier
-            .width(200.dp)
-            .height(140.dp),
+            .then(if (compact) Modifier.fillMaxWidth() else Modifier.width(220.dp))
+            .height(if (compact) 120.dp else 168.dp),
         colors = CardDefaults.cardColors(
-            containerColor = if (productItem.isSuccess) {
-                Color(0xFFE8F5E9)  // 成功 - 浅绿色
-            } else {
-                Color(0xFFFFEBEE)  // 失败 - 浅红色
-            }
+            containerColor = if (productItem.isSuccess) Color(0xFFECFDF5) else Color(0xFFFEF2F2)
         ),
         border = BorderStroke(
-            2.dp,
-            if (productItem.isSuccess) Color(0xFF4CAF50) else Color(0xFFF44336)
+            1.dp,
+            if (productItem.isSuccess) Color(0xFF34D399) else Color(0xFFF87171)
         )
     ) {
         Column(
@@ -635,148 +665,115 @@ fun ProductCardWithStatus(
                 .padding(12.dp),
             verticalArrangement = Arrangement.SpaceBetween
         ) {
-            // 顶部：状态标识
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Text(
-                    text = if (productItem.isSuccess) "✓ 成功" else "✗ 失败",
-                    fontSize = 12.sp,
+                    text = when {
+                        !productItem.isSuccess -> "失败"
+                        compact -> "其他方案"
+                        else -> "可购买"
+                    },
+                    fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
-                    color = if (productItem.isSuccess) Color(0xFF2E7D32) else Color(0xFFC62828)
+                    color = if (productItem.isSuccess) Color(0xFF047857) else Color(0xFFB91C1C)
                 )
-                
                 Text(
                     text = productItem.productType.name,
                     fontSize = 10.sp,
-                    color = Color.Gray
+                    color = Color(0xFF64748B)
                 )
             }
-            
-            // 中间：商品信息
-            Column(
-                modifier = Modifier.weight(1f)
-            ) {
+
+            Column {
                 Text(
-                    text = productItem.productId,
+                    text = product?.title?.ifBlank { productItem.productId } ?: productItem.productId,
                     fontSize = 14.sp,
                     fontWeight = FontWeight.SemiBold,
                     maxLines = 2,
-                    color = Color.Black
+                    overflow = TextOverflow.Ellipsis,
+                    color = Color(0xFF0F172A)
                 )
-                
-                if (!productItem.isSuccess) {
+                if (productItem.isSuccess && product != null) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = product.price.ifBlank { "价格未知" },
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF4F46E5)
+                    )
+                } else if (!productItem.isSuccess) {
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
                         text = productItem.errorMessage ?: "未知错误",
-                        fontSize = 10.sp,
-                        color = Color.Red,
-                        maxLines = 2
+                        fontSize = 11.sp,
+                        color = Color(0xFFB91C1C),
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }
-            
-            // 底部：购买按钮
+
             if (productItem.isSuccess) {
                 Button(
-                    onClick = { 
-                        val offerId = when {
-                            productItem.productId.contains("MONTH") -> Constants.BASIC_MONTHLY_PLAN
-                            productItem.productId.contains("YEAR") -> Constants.BASIC_YEARLY_PLAN
-                            else -> ""
-                        }
-                        onPurchase(productItem.productId, offerId)
-                    },
+                    onClick = { onPurchase(productItem) },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(32.dp),
-                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                        .height(36.dp),
+                    contentPadding = PaddingValues(0.dp)
                 ) {
-                    Text("购买", fontSize = 12.sp)
+                    Text("购买", fontSize = 13.sp)
                 }
             }
         }
     }
 }
 
-/**
- * 章节标题
- */
 @Composable
 fun SectionTitle(title: String) {
     Text(
         text = title,
-        fontSize = 20.sp,
+        fontSize = 18.sp,
         fontWeight = FontWeight.Bold,
-        color = Color(0xFF1F2937),
-        modifier = Modifier.padding(vertical = 8.dp)
+        color = Color(0xFF0F172A),
+        modifier = Modifier.padding(top = 4.dp)
     )
 }
 
-/**
- * 查询按钮
- */
 @Composable
 fun QueryButton(
     text: String,
     onClick: () -> Unit,
-    icon: String
+    enabled: Boolean = true
 ) {
     Button(
         onClick = onClick,
+        enabled = enabled,
         modifier = Modifier
             .fillMaxWidth()
-            .height(56.dp),
-        colors = ButtonDefaults.buttonColors(
-            containerColor = Color(0xFF6366F1)
-        ),
-        shape = MaterialTheme.shapes.medium,
-        elevation = ButtonDefaults.buttonElevation(defaultElevation = 4.dp)
+            .height(52.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4F46E5)),
+        shape = MaterialTheme.shapes.medium
     ) {
-        Text(
-            text = "$icon  $text",
-            fontSize = 16.sp,
-            fontWeight = FontWeight.SemiBold
-        )
+        Text(text = text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 
-/**
- * 功能按钮
- */
 @Composable
 fun FeatureButton(
     text: String,
     onClick: () -> Unit,
-    icon: String,
     backgroundColor: Color
 ) {
     Button(
         onClick = onClick,
         modifier = Modifier
             .fillMaxWidth()
-            .height(56.dp),
-        colors = ButtonDefaults.buttonColors(
-            containerColor = backgroundColor
-        ),
-        shape = MaterialTheme.shapes.medium,
-        elevation = ButtonDefaults.buttonElevation(defaultElevation = 4.dp)
+            .height(52.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = backgroundColor),
+        shape = MaterialTheme.shapes.medium
     ) {
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = icon,
-                fontSize = 20.sp
-            )
-            Text(
-                text = text,
-                fontSize = 16.sp,
-                fontWeight = FontWeight.SemiBold
-            )
-        }
+        Text(text = text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
     }
 }

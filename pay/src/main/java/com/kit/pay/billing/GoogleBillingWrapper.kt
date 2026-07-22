@@ -9,6 +9,8 @@ import com.kit.pay.models.ProductType
 import com.kit.pay.models.PurchaseState
 import com.kit.pay.models.StoreProduct
 import com.kit.pay.models.StoreTransaction
+import com.kit.pay.models.SubscriptionReplacement
+import com.kit.pay.models.SubscriptionReplacementMode
 import com.kit.pay.utils.LogUtil
 import kotlinx.coroutines.delay
 import java.lang.ref.WeakReference
@@ -336,7 +338,8 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
     override suspend fun makePurchaseAsync(
         activity: WeakReference<Activity>,
         storeProduct: StoreProduct,
-        isOfferPersonalized: Boolean
+        isOfferPersonalized: Boolean,
+        subscriptionReplacement: SubscriptionReplacement?
     ): Result<Unit> {
         if (!ensureConnected()) {
             logE("makePurchase abort reason=not_connected productId=${storeProduct.productId}")
@@ -355,6 +358,15 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
         else
             BillingClient.ProductType.INAPP
 
+        if (subscriptionReplacement != null && gType != BillingClient.ProductType.SUBS) {
+            return Result.failure(
+                PayKitError(
+                    ErrorCode.STORE_PROBLEM,
+                    "subscriptionReplacement is only valid for SUBS products"
+                )
+            )
+        }
+
         val productDetailsParamsList = if (gType == BillingClient.ProductType.SUBS) {
             val token = storeProduct.subscriptionToken ?: return Result.failure(
                 PayKitError(
@@ -362,12 +374,19 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
                     "Missing offer token for subs"
                 )
             )
-            listOf(
-                BillingFlowParams.ProductDetailsParams.newBuilder()
-                    .setProductDetails(pDetail)
-                    .setOfferToken(token)
-                    .build()
-            )
+            val productParams = BillingFlowParams.ProductDetailsParams.newBuilder()
+                .setProductDetails(pDetail)
+                .setOfferToken(token)
+            if (subscriptionReplacement != null) {
+                productParams.setSubscriptionProductReplacementParams(
+                    BillingFlowParams.ProductDetailsParams.SubscriptionProductReplacementParams
+                        .newBuilder()
+                        .setOldProductId(subscriptionReplacement.oldProductId)
+                        .setReplacementMode(subscriptionReplacement.replacementMode.toBillingMode())
+                        .build()
+                )
+            }
+            listOf(productParams.build())
         } else {
             listOf(
                 BillingFlowParams.ProductDetailsParams.newBuilder()
@@ -376,10 +395,17 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
             )
         }
 
-        val flowParams = BillingFlowParams.newBuilder()
+        val flowBuilder = BillingFlowParams.newBuilder()
             .setProductDetailsParamsList(productDetailsParamsList)
             .setIsOfferPersonalized(isOfferPersonalized)
-            .build()
+        if (subscriptionReplacement != null) {
+            flowBuilder.setSubscriptionUpdateParams(
+                BillingFlowParams.SubscriptionUpdateParams.newBuilder()
+                    .setOldPurchaseToken(subscriptionReplacement.oldPurchaseToken)
+                    .build()
+            )
+        }
+        val flowParams = flowBuilder.build()
         val activity = activity.get() ?: return Result.failure(
             PayKitError(
                 ErrorCode.UNKNOWN,
@@ -389,12 +415,17 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
         val response = billingClient.launchBillingFlow(activity, flowParams)
 
         return if (response.responseCode != BillingClient.BillingResponseCode.OK) {
-            logE("launchBillingFlow fail productId=${storeProduct.productId} code=${response.responseCode} msg=${response.debugMessage}")
+            logE(
+                "launchBillingFlow fail productId=${storeProduct.productId} " +
+                    "code=${response.responseCode} msg=${response.debugMessage} " +
+                    "replace=${subscriptionReplacement?.oldProductId}"
+            )
             Result.failure(response.toPayKitError())
         } else {
             logD(
                 "launchBillingFlow success productId=${storeProduct.productId} " +
-                    "type=${storeProduct.type} personalized=$isOfferPersonalized"
+                    "type=${storeProduct.type} personalized=$isOfferPersonalized " +
+                    "replace=${subscriptionReplacement?.oldProductId}"
             )
             Result.success(Unit)
         }
@@ -593,4 +624,19 @@ private fun Purchase.toStoreTransaction(): StoreTransaction {
             else -> PurchaseState.UNSPECIFIED
         }
     )
+}
+
+private fun SubscriptionReplacementMode.toBillingMode(): Int {
+    return when (this) {
+        SubscriptionReplacementMode.WITH_TIME_PRORATION ->
+            BillingReplacementModes.WITH_TIME_PRORATION
+        SubscriptionReplacementMode.CHARGE_PRORATED_PRICE ->
+            BillingReplacementModes.CHARGE_PRORATED_PRICE
+        SubscriptionReplacementMode.WITHOUT_PRORATION ->
+            BillingReplacementModes.WITHOUT_PRORATION
+        SubscriptionReplacementMode.CHARGE_FULL_PRICE ->
+            BillingReplacementModes.CHARGE_FULL_PRICE
+        SubscriptionReplacementMode.DEFERRED ->
+            BillingReplacementModes.DEFERRED
+    }
 }

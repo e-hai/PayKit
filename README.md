@@ -192,6 +192,19 @@ fun purchaseProduct(activity: Activity, productId: String) {
 }
 ```
 
+升降级 / 同商品换档时传入 `SubscriptionReplacement`（可用 `findActiveSubscription` 取旧 token）：
+
+```kotlin
+val old = PayKit.shared.findActiveSubscription("subs_plus")
+val replacement = old?.let {
+    SubscriptionReplacement(
+        oldProductId = "subs_plus",
+        oldPurchaseToken = it.purchaseToken
+    )
+}
+PayKit.shared.purchase(activity, proProduct, callback, subscriptionReplacement = replacement)
+```
+
 ### 场景 3：检查用户权益
 
 ```kotlin

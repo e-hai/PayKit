@@ -111,11 +111,16 @@ class PayKit private constructor(
                 "count=${allTransactions.size}"
         )
 
-        if (subsResult.isFailure && inappResult.isFailure) {
+        // 任一侧查询失败都不得用「半份」订单重算权益，否则会清空另一侧的活跃订阅/非消耗
+        if (subsResult.isFailure || inappResult.isFailure) {
             val error = subsResult.exceptionOrNull()
                 ?: inappResult.exceptionOrNull()
                 ?: PayKitError(ErrorCode.STORE_PROBLEM, "Failed to query purchases")
-            LogUtil.e("syncPurchases queryFail fallbackCache=${cachedInfo != null} msg=${error.message}")
+            LogUtil.e(
+                "syncPurchases queryFail " +
+                    "subsOk=${subsResult.isSuccess} inappOk=${inappResult.isSuccess} " +
+                    "fallbackCache=${cachedInfo != null} msg=${error.message}"
+            )
             return@coroutineScope if (cachedInfo != null) {
                 Result.success(cachedInfo)
             } else {
@@ -288,30 +293,46 @@ class PayKit private constructor(
         }
 
     /**
+     * 从本地缓存查找某订阅 product 当前活跃订单（不同步商店）。
+     * 用于构建 [SubscriptionReplacement]。
+     */
+    fun findActiveSubscription(productId: String): StoreTransaction? {
+        val info = deviceCache.getCachedCustomerInfo() ?: return null
+        if (productId !in info.activeSubscriptions) return null
+        return info.purchasedRecords
+            .filter { productId in it.productIds && it.isAcknowledged }
+            .maxByOrNull { it.purchaseTime }
+    }
+
+    /**
      * 发起支付。
      *
      * 回调（[PurchaseCallback]）一律在**主线程**投递。
      *
      * @param isOfferPersonalized 是否披露个性化价格（欧盟消费者保护要求）。
      * 默认取 [PayKitConfiguration.isOfferPersonalizedDefault]。
+     * @param subscriptionReplacement 订阅升降级 / 同商品换档时传入；新购为 null。
      */
     fun purchase(
         activity: Activity,
         storeProduct: StoreProduct,
         callback: PurchaseCallback,
-        isOfferPersonalized: Boolean = configuration.isOfferPersonalizedDefault
+        isOfferPersonalized: Boolean = configuration.isOfferPersonalizedDefault,
+        subscriptionReplacement: SubscriptionReplacement? = null
     ) {
         this.activePurchaseCallback = callback
         LogUtil.d(
             "purchase start productId=${storeProduct.productId} type=${storeProduct.type} " +
-                "personalized=$isOfferPersonalized"
+                "personalized=$isOfferPersonalized " +
+                "replace=${subscriptionReplacement?.oldProductId}"
         )
 
         applicationScope.launch {
             val result = billingWrapper.makePurchaseAsync(
                 WeakReference(activity),
                 storeProduct,
-                isOfferPersonalized
+                isOfferPersonalized,
+                subscriptionReplacement
             )
             result.onFailure { error ->
                 LogUtil.e(

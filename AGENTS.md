@@ -120,12 +120,14 @@ suspend fun restorePurchases(): Result<CustomerInfo>   // 同 syncPurchases，�
 suspend fun getPendingPurchases(): List<StoreTransaction>
 suspend fun getPurchaseHistory(): List<StoreTransaction>
 fun findTransaction(purchaseToken: String): StoreTransaction?
+fun findActiveSubscription(productId: String): StoreTransaction?
 
 fun purchase(
     activity: Activity,              // 对外收 Activity；内部再包 WeakReference
     storeProduct: StoreProduct,
     callback: PurchaseCallback,      // 主线程回调
-    isOfferPersonalized: Boolean = configuration.isOfferPersonalizedDefault
+    isOfferPersonalized: Boolean = configuration.isOfferPersonalizedDefault,
+    subscriptionReplacement: SubscriptionReplacement? = null  // Plus↔Pro / 换档
 )
 
 fun setUpdatedCustomerInfoListener(listener: UpdatedCustomerInfoListener?)  // 主线程回调
@@ -139,6 +141,12 @@ data class PayKitConfiguration(
     val consumableProductIds: Set<String> = emptySet(),
     val nonConsumableProductIds: Set<String> = emptySet(),
     val isOfferPersonalizedDefault: Boolean = false  // 欧盟个性化报价默认
+)
+
+data class SubscriptionReplacement(
+    val oldProductId: String,
+    val oldPurchaseToken: String,
+    val replacementMode: SubscriptionReplacementMode = WITH_TIME_PRORATION
 )
 
 data class CustomerInfo(
@@ -258,9 +266,10 @@ acknowledge fail orderId=... code=6 msg=...
 - `StoreProduct.nativeProductDetails` 为 `@Transient`，不可依赖序列化还原后再购买。
 - **订单状态**：只对 `PurchaseState.PURCHASED` 且 acknowledge/consume **成功** 的订单发权益；`PENDING` 走 `PurchaseCallback.onPending`；确认失败时 `syncPurchases`/`restorePurchases` 返回 `Result.failure`，购买回调走 `onError`，下次同步会重试确认。
 - **Billing 连接**：`ensureConnected` 失败时各 Billing 操作直接 `Result.failure`，不再继续调用。
-- **同步查询**：`syncPurchasesInternal` 中 SUBS / INAPP 使用 `async` 并行查询。
+- **同步查询**：`syncPurchasesInternal` 中 SUBS / INAPP 使用 `async` 并行查询；**任一侧失败**都不会用半份订单重算权益（回退缓存或 failure），避免清空另一侧活跃权益。
 - **恢复购买**：Google 无独立 Restore API；`restorePurchases()` ≡ `syncPurchases()`，仅产品命名不同。
 - **欧盟个性化报价**：通过 `BillingFlowParams.setIsOfferPersonalized`；配置 `isOfferPersonalizedDefault` 或 `purchase(..., isOfferPersonalized = true)`。未个性化时保持 `false`。
+- **订阅升降级**：已有订阅时须传 `SubscriptionReplacement`（旧 productId + purchaseToken）；Billing 8 使用 `SubscriptionProductReplacementParams` + `setOldPurchaseToken`。Demo 在 Plus↔Pro / 同档换周期时自动填充。
 - Demo `applicationId` 固定为 `com.google.play.billing.samples.onetimepurchases`（官方 Billing sample 包名，用于对接既有 Play Console 商品）；`namespace` 为 `com.kit.pay.sample`。**禁止修改 `applicationId`**，二者本就可以不同，勿假设必须一致。
 - 真机 / 内测轨道验证支付；模拟器通常无法完整走 Google Play 结算。
 

@@ -15,6 +15,7 @@ import com.kit.pay.models.PayKitConfiguration
 import com.kit.pay.models.ProductType
 import com.kit.pay.models.StoreProduct
 import com.kit.pay.models.StoreTransaction
+import com.kit.pay.models.SubscriptionReplacement
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -239,40 +240,73 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun purchaseStoreProduct(activity: Activity, product: StoreProduct) {
+        val replacement = resolveSubscriptionReplacement(product)
         Log.d(
             TAG,
             "purchase productId=${product.productId} type=${product.type} " +
-                "hasOfferToken=${!product.subscriptionToken.isNullOrEmpty()}"
+                "hasOfferToken=${!product.subscriptionToken.isNullOrEmpty()} " +
+                "replace=${replacement?.oldProductId}"
         )
-        PayKit.shared.purchase(activity, product, object : PurchaseCallback {
-            override fun onCompleted(
-                storeTransaction: StoreTransaction,
-                customerInfo: CustomerInfo
-            ) {
-                Log.d(TAG, "purchase completed orderId=${storeTransaction.orderId}")
-                applyCustomerInfo(customerInfo)
-                showToast("支付成功 ${storeTransaction.orderId}")
-            }
-
-            override fun onPending(storeTransaction: StoreTransaction) {
-                Log.d(TAG, "purchase pending orderId=${storeTransaction.orderId}")
-                showToast("支付待确认，完成后将自动到账")
-                // 同步一下以便 pending 出现在权益视图
-                viewModelScope.launch {
-                    PayKit.shared.getCustomerInfo(forceSync = true)?.let { applyCustomerInfo(it) }
+        PayKit.shared.purchase(
+            activity,
+            product,
+            object : PurchaseCallback {
+                override fun onCompleted(
+                    storeTransaction: StoreTransaction,
+                    customerInfo: CustomerInfo
+                ) {
+                    Log.d(TAG, "purchase completed orderId=${storeTransaction.orderId}")
+                    applyCustomerInfo(customerInfo)
+                    showToast("支付成功 ${storeTransaction.orderId}")
                 }
-            }
 
-            override fun onError(error: PayKitError, userCancelled: Boolean) {
-                if (userCancelled) {
-                    Log.d(TAG, "purchase cancelled")
-                    showToast("已取消支付")
-                } else {
-                    Log.e(TAG, "purchase error code=${error.code} msg=${error.message}")
-                    showError("支付失败：${error.message} (${error.code})")
+                override fun onPending(storeTransaction: StoreTransaction) {
+                    Log.d(TAG, "purchase pending orderId=${storeTransaction.orderId}")
+                    showToast("支付待确认，完成后将自动到账")
+                    viewModelScope.launch {
+                        PayKit.shared.getCustomerInfo(forceSync = true)?.let { applyCustomerInfo(it) }
+                    }
                 }
-            }
-        })
+
+                override fun onError(error: PayKitError, userCancelled: Boolean) {
+                    if (userCancelled) {
+                        Log.d(TAG, "purchase cancelled")
+                        showToast("已取消支付")
+                    } else {
+                        Log.e(TAG, "purchase error code=${error.code} msg=${error.message}")
+                        showError("支付失败：${error.message} (${error.code})")
+                    }
+                }
+            },
+            subscriptionReplacement = replacement
+        )
+    }
+
+    /**
+     * Plus ↔ Pro 升降级，或同档换 base plan，需带旧订阅 token。
+     */
+    private fun resolveSubscriptionReplacement(
+        product: StoreProduct
+    ): SubscriptionReplacement? {
+        if (product.type != ProductType.SUBS) return null
+        val active = _entitlement.value.activeSubs
+        val oldProductId = when {
+            product.productId == Constants.SUBS_PRO && Constants.SUBS_PLUS in active ->
+                Constants.SUBS_PLUS
+            product.productId == Constants.SUBS_PLUS && Constants.SUBS_PRO in active ->
+                Constants.SUBS_PRO
+            product.productId in active -> product.productId
+            else -> null
+        } ?: return null
+
+        val oldTxn = PayKit.shared.findActiveSubscription(oldProductId) ?: run {
+            Log.w(TAG, "replace needed but no active txn oldProductId=$oldProductId")
+            return null
+        }
+        return SubscriptionReplacement(
+            oldProductId = oldProductId,
+            oldPurchaseToken = oldTxn.purchaseToken
+        )
     }
 
     private fun showToast(message: String) {

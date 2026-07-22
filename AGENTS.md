@@ -4,7 +4,7 @@
 
 ## What This Project Is
 
-轻量级 Android Google Play 支付 SDK（`:pay`）+ Compose 示例 App（`:app`）。
+轻量级 Android Google Play 支付 SDK（`:pay`）+ Compose 示例 App（`:sample`）。
 
 封装 [Google Play Billing Library](https://developer.android.com/google/play/billing) **8.3.0**，对外提供简洁、**纯本地无后端**的协程 API：
 
@@ -25,12 +25,13 @@ PayKit/
 │       ├── billing/
 │       │   ├── BillingAbstract.kt    # 支付抽象层 + PurchasesUpdatedListener
 │       │   └── GoogleBillingWrapper.kt  # BillingClient 实现
-│       ├── caching/DeviceCache.kt    # CustomerInfo 本地持久化
+│       ├── caching/DeviceCache.kt    # CustomerInfo 权益快照持久化
+│       ├── caching/ConsumableLedger.kt # 消耗品履约账本（待 consume）
 │       ├── subscriber/CustomerInfoHelper.kt  # 订单 → 权益归类
 │       ├── models/                   # PayKitConfiguration / CustomerInfo / StoreProduct / StoreTransaction
-│       ├── interfaces/               # PurchaseCallback / UpdatedCustomerInfoListener / PayKitError
+│       ├── interfaces/               # PurchaseCallback / PurchaseVerifier / UpdatedCustomerInfoListener / PayKitError
 │       └── utils/LogUtil.kt
-├── app/                          # 示例 App（namespace: com.kit.pay.sample）
+├── sample/                       # 示例 App（namespace: com.kit.pay.sample）
 │   └── src/main/java/com/kit/pay/sample/
 │       ├── App.kt
 │       ├── MainActivity.kt       # Compose Demo UI
@@ -40,7 +41,7 @@ PayKit/
 ├── README.md                     # 宿主集成文档（面向人）
 ├── GOOGLE_PLAY_BILLING_DETAILS.md # Billing 参数详解（调试用）
 ├── AGENTS.md                     # 本文件
-└── settings.gradle.kts           # include :app, :pay
+└── settings.gradle.kts           # include :sample, :pay
 ```
 
 本地集成：
@@ -63,10 +64,10 @@ JitPack：`jitpack.yml` 只发布 `:pay`；`pay/build.gradle.kts` 使用 `maven-
 | JDK | 17 |
 | Billing Library | 8.3.0 |
 | `:pay` minSdk / compileSdk | 21 / 36 |
-| `:app` minSdk / compileSdk | 23 / 36 |
+| `:sample` minSdk / compileSdk | 23 / 36 |
 
 - `:pay`：`android.library` + `kotlin.android`
-- `:app`：`android.application` + `kotlin.android` + Compose Compiler 插件
+- `:sample`：`android.application` + `kotlin.android` + Compose Compiler 插件
 - 依赖用 Version Catalog 的 `libs.bundles.pay` / `libs.bundles.app`
 
 ## Architecture
@@ -87,10 +88,10 @@ DeviceCache  CustomerInfoHelper  BillingAbstract
 ### Core Data Flow
 
 1. **Init**：`PayKit.configure(context, configuration)` → `startConnection` → `syncPurchasesInternal()`（本地缓存由 `getCustomerInfo(forceSync = false)` 按需读取）
-2. **Sync / 恢复**：`syncPurchases()` / `restorePurchases()` → 查 `SUBS` + `INAPP` → **仅 `PURCHASED`** acknowledge/consume → 更新 `CustomerInfo`（PENDING 进历史、不进活跃权益）
+2. **Sync / 恢复**：`syncPurchases()` / `restorePurchases()` → 查 `SUBS` + `INAPP` → 订阅/非消耗 **acknowledge**；消耗品仅当履约账本已标记才 **consume** → 更新 `CustomerInfo`（当前商店快照，不无限合并历史）
 3. **Query**：`getProducts(ids)` 按配置拆分 SUBS / INAPP，调用 `queryProductDetails`
-4. **Purchase**：`purchase(...)` → `launchBillingFlow` → `onPurchasesUpdated` → sync → `onCompleted` / `onPending` / `onError`
-5. **查权益**：启动用 `getCustomerInfo(forceSync = false)` + Listener（SDK 连上后会自动 sync）；订单视图用 `pendingPurchases` / `getPendingPurchases()` 等
+4. **Purchase**：`purchase(...)` → `launchBillingFlow` → `onPurchasesUpdated` → sync → 消耗品先记账本 → `onCompleted`（宿主发货）→ consume；失败留账本重试
+5. **查权益**：启动用 `getCustomerInfo(forceSync = false)` + Listener；未履约消耗品见 `CustomerInfo.unfulfilledConsumables` / `markConsumableFulfilled`
 
 ### Product Type Mapping（易错）
 
@@ -107,8 +108,10 @@ DeviceCache  CustomerInfoHelper  BillingAbstract
 包名：`com.kit.pay`。改签名或语义前需评估破坏性。
 
 ```kotlin
-// 初始化（只生效一次）
+// 初始化（只生效一次，除非 PayKit.reset()）
 PayKit.configure(context: Context, configuration: PayKitConfiguration)
+PayKit.reset()  // 断开连接、默认清空本地权益缓存；改配置 / 测试前调用
+PayKit.reset(clearCache = false)  // 仅拆单例，保留缓存
 
 // 单例
 PayKit.shared
@@ -118,9 +121,11 @@ suspend fun getCustomerInfo(forceSync: Boolean = true): CustomerInfo?
 suspend fun syncPurchases(): Result<CustomerInfo>
 suspend fun restorePurchases(): Result<CustomerInfo>   // 同 syncPurchases，产品语义
 suspend fun getPendingPurchases(): List<StoreTransaction>
-suspend fun getPurchaseHistory(): List<StoreTransaction>
+suspend fun getPurchaseHistory(): List<StoreTransaction>  // 当前商店快照，非无限本地史
 fun findTransaction(purchaseToken: String): StoreTransaction?
 fun findActiveSubscription(productId: String): StoreTransaction?
+fun getConsumablesPendingConsume(): List<ConsumableLedgerEntry>
+suspend fun markConsumableFulfilled(purchaseToken: String): Result<Unit>
 
 fun purchase(
     activity: Activity,              // 对外收 Activity；内部再包 WeakReference
@@ -131,6 +136,7 @@ fun purchase(
 )
 
 fun setUpdatedCustomerInfoListener(listener: UpdatedCustomerInfoListener?)  // 主线程回调
+fun setPurchaseVerifier(verifier: PurchaseVerifier)  // 默认 LocalPurchaseVerifier
 ```
 
 ### 关键模型
@@ -140,7 +146,8 @@ data class PayKitConfiguration(
     val subsProductIds: Set<String> = emptySet(),
     val consumableProductIds: Set<String> = emptySet(),
     val nonConsumableProductIds: Set<String> = emptySet(),
-    val isOfferPersonalizedDefault: Boolean = false  // 欧盟个性化报价默认
+    val isOfferPersonalizedDefault: Boolean = false,  // 欧盟个性化报价默认
+    val purchaseVerifier: PurchaseVerifier = LocalPurchaseVerifier  // 验单扩展
 )
 
 data class SubscriptionReplacement(
@@ -152,7 +159,8 @@ data class SubscriptionReplacement(
 data class CustomerInfo(
     val activeSubscriptions: Set<String> = emptySet(),
     val nonConsumablePurchases: Set<String> = emptySet(),
-    val allPurchaseRecords: List<StoreTransaction> = emptyList()
+    val allPurchaseRecords: List<StoreTransaction> = emptyList(), // 当前商店快照
+    val unfulfilledConsumables: List<StoreTransaction> = emptyList() // 待宿主发货的消耗品
 ) {
     val pendingPurchases: List<StoreTransaction>   // 计算属性
     val purchasedRecords: List<StoreTransaction>   // 计算属性
@@ -163,22 +171,23 @@ data class StoreProduct(
     val type: ProductType,           // SUBS | INAPP
     val title: String,
     val description: String,
-    val price: String,
+    val price: String,               // 展示价：订阅优先为正价（试用后）
     val priceAmountMicros: Long,
     val priceCurrencyCode: String,
-    val subscriptionToken: String? = null,   // 订阅必填 offerToken
+    val subscriptionToken: String? = null,   // Google offerToken（订阅必填；INAPP 多 offer 亦需）
     val basePlanId: String? = null,          // 订阅 base plan
-    val offerId: String? = null,             // 优惠 ID；基础价可能为 null
+    val offerId: String? = null,             // 优惠 / 购买选项 ID
     val hasFreeTrial: Boolean = false,       // 首阶段 priceAmountMicros==0
+    val freeTrialPeriod: String? = null,     // 试用周期 ISO8601，如 P1W
     @Transient val nativeProductDetails: Any? = null  // 底层 ProductDetails，购买用
 )
 ```
 
-`StoreTransaction` 含 `purchaseState: PurchaseState`（`PURCHASED` / `PENDING` / `UNSPECIFIED`）。
+`StoreTransaction` 含 `purchaseState`（`PURCHASED` / `PENDING` / `UNSPECIFIED`）、`isAutoRenewing`、`isSuspended`，以及服务端验签用的 `signature` / `originalJson`（客户端 Purchase；精确到期/宽限期仍需服务端）。
 
 ### Demo 订阅模型
 
-Demo（`:app`）采用 Google Play 推荐层级：**一个 product = 一个权益档**。
+Demo（`:sample`）采用 Google Play 推荐层级：**一个 product = 一个权益档**。
 
 ```
 Product [subs_pro]              → Pro 权益
@@ -204,7 +213,28 @@ Product [subs_plus]             → Plus 权益
 | `PurchaseCallback` | `onCompleted` 发货；`onPending` 待确认勿发货；`onError` 失败/取消（**主线程**） |
 | `UpdatedCustomerInfoListener` | 权益变化（同步完成、购买后等）（**主线程**） |
 
-错误码见 `ErrorCode`：`STORE_PROBLEM` / `PURCHASE_CANCELLED` / `PURCHASE_PENDING` / `PRODUCT_NOT_AVAILABLE` / `NETWORK_ERROR` / `UNKNOWN` 等。
+错误码见 `ErrorCode`：`STORE_PROBLEM` / `PURCHASE_CANCELLED` / `PURCHASE_PENDING` / `PURCHASE_IN_PROGRESS` / `PURCHASE_NOT_ALLOWED` / `PRODUCT_NOT_AVAILABLE` / `ITEM_ALREADY_OWNED` / `VERIFICATION_FAILED` / `NETWORK_ERROR` / `UNKNOWN`。
+
+### PurchaseVerifier（服务端接入扩展）
+
+默认 [LocalPurchaseVerifier] 不联网。接入服务端时实现 [PurchaseVerifier]，在 `onCompleted` / `markConsumableFulfilled` 之前用 `purchaseToken`（或 `signature` + `originalJson`）调后端验单：
+
+```kotlin
+PayKit.configure(
+    context,
+    PayKitConfiguration(
+        /* … */,
+        purchaseVerifier = PurchaseVerifier { txn ->
+            // 将 txn.purchaseToken / productIds 发给服务端，成功则 Result.success(Unit)
+            myApi.verifyWithGoogle(txn.purchaseToken)
+        }
+    )
+)
+// 或运行时替换：
+PayKit.shared.setPurchaseVerifier(myVerifier)
+```
+
+验单失败 → `PurchaseCallback.onError`（`VERIFICATION_FAILED`），不记账本、不 consume。
 
 ## Logging
 
@@ -248,9 +278,9 @@ acknowledge fail orderId=... code=6 msg=...
 
 1. **先读再改**：改 Billing 逻辑前对照 `GOOGLE_PLAY_BILLING_DETAILS.md` 与官方 Billing 8.x API。
 2. **保持公开 API 稳定**：`PayKit.purchase(Activity, ...)` 对外必须是 `Activity`；`WeakReference` 仅限 Billing 层内部。
-3. **不要擅自「修复」`activePurchaseCallback` 的单回调设计**，除非用户明确要求（当前刻意只支持单笔进行中购买）。
-4. **无服务端校验**：不要在 SDK 内假装已有收据验签；若增加服务端能力，应明确新 API 与配置，避免 silently 改变现有行为。
-5. **订阅权益偏粗**：`activeSubscriptions` 目前 = Google 当前购买列表中的订阅 ID，未建模宽限期 / 账号保留 / 过期时间；扩展时勿破坏现有字段语义。
+3. **不要擅自「修复」`activePurchaseCallback` 的单回调设计**，除非用户明确要求（当前刻意只支持单笔进行中购买；二次 `purchase` 返回 `PURCHASE_IN_PROGRESS`，不会顶掉前一次回调）。
+4. **无服务端校验为默认**：默认 [LocalPurchaseVerifier]；接入服务端须显式实现 [PurchaseVerifier]，勿在 SDK 内 silently 假装已验签。
+5. **订阅权益偏粗**：`activeSubscriptions` = 当前购买列表中的订阅 ID；`StoreTransaction` 另有 `isAutoRenewing` / `isSuspended`。精确到期、宽限期、账号保留细节仍依赖服务端；扩展时勿破坏现有字段语义。
 6. **配置必须完整**：新增商品相关逻辑时，始终以 `PayKitConfiguration` 三分法为准，禁止仅凭 `ProductType.INAPP` 判断是否消耗。
 7. **版本变更**：改 Billing / AGP / Kotlin 版本时只改 `gradle/libs.versions.toml`，并同步 README「版本信息」。
 8. **文档同步**：改公开 API 签名时，必须同步更新 `README.md` 与本文件对应段落。
@@ -260,27 +290,33 @@ acknowledge fail orderId=... code=6 msg=...
 
 ## Implementation Caveats
 
-- `configure` 双重检查锁，重复调用不会重建实例；改配置需进程级重新初始化（当前无 `reset` API）。
+- `configure` 双重检查锁，重复调用不会重建实例；改配置先 [PayKit.reset]（默认清缓存），再 `configure`。
 - `getCustomerInfo()` / `syncPurchases()` 在 IO 调度；**公开回调已切主线程**（`MainThreadDispatcher`），Demo/宿主可直接更新 UI。
-- 订阅购买缺少 `subscriptionToken`（offerToken）会启动失败。
+- 订阅购买缺少 `subscriptionToken`（offerToken）会启动失败；一次性多 offer 时同样应带上 token。
 - `StoreProduct.nativeProductDetails` 为 `@Transient`，不可依赖序列化还原后再购买。
-- **订单状态**：只对 `PurchaseState.PURCHASED` 且 acknowledge/consume **成功** 的订单发权益；`PENDING` 走 `PurchaseCallback.onPending`；确认失败时 `syncPurchases`/`restorePurchases` 返回 `Result.failure`，购买回调走 `onError`，下次同步会重试确认。
+- `StoreProduct.price` 对含试用的 offer 展示**正价**（首个非 0 定价阶段）；`hasFreeTrial` / `freeTrialPeriod` 标识试用。
+- **INAPP 多 offer**：优先展开 `oneTimePurchaseOfferDetailsList`，每条 offer 一条 `StoreProduct`；购买时 `setOfferToken`。
+- **订单状态**：订阅/非消耗仅对 `PURCHASED` 且 acknowledge **成功** 计入权益；消耗品在购买回调中先记履约账本再 `onCompleted`，然后 consume，失败留账本由下次 sync / `markConsumableFulfilled` 重试。
+- **本地存储分层**：`DeviceCache` 缓存订阅/非消耗权益快照；`ConsumableLedger` 仅持久化「已发货待 consume」的消耗品 token。`allPurchaseRecords` 为当前商店查询快照，不再无限合并历史。
+- **启动补单消耗品**：若 `CustomerInfo.unfulfilledConsumables` 非空，宿主发货后调用 `markConsumableFulfilled(token)`。
 - **Billing 连接**：`ensureConnected` 失败时各 Billing 操作直接 `Result.failure`，不再继续调用。
 - **同步查询**：`syncPurchasesInternal` 中 SUBS / INAPP 使用 `async` 并行查询；**任一侧失败**都不会用半份订单重算权益（回退缓存或 failure），避免清空另一侧活跃权益。
 - **恢复购买**：Google 无独立 Restore API；`restorePurchases()` ≡ `syncPurchases()`，仅产品命名不同。
 - **欧盟个性化报价**：通过 `BillingFlowParams.setIsOfferPersonalized`；配置 `isOfferPersonalizedDefault` 或 `purchase(..., isOfferPersonalized = true)`。未个性化时保持 `false`。
 - **订阅升降级**：已有订阅时须传 `SubscriptionReplacement`（旧 productId + purchaseToken）；Billing 8 使用 `SubscriptionProductReplacementParams` + `setOldPurchaseToken`。Demo 在 Plus↔Pro / 同档换周期时自动填充。
+- `getProducts`：未在 `PayKitConfiguration` 中声明的 ID 会打 warn；若请求的 ID **全部**未声明则 `Result.failure`。
 - Demo `applicationId` 固定为 `com.google.play.billing.samples.onetimepurchases`（官方 Billing sample 包名，用于对接既有 Play Console 商品）；`namespace` 为 `com.kit.pay.sample`。**禁止修改 `applicationId`**，二者本就可以不同，勿假设必须一致。
 - 真机 / 内测轨道验证支付；模拟器通常无法完整走 Google Play 结算。
 
 ## Testing / Build
 
-当前无单元测试模块。常用命令：
-
 ```bash
+./gradlew :pay:testDebugUnitTest
 ./gradlew :pay:assembleDebug
-./gradlew :app:assembleDebug
+./gradlew :sample:assembleDebug
 ```
+
+CI：`.github/workflows/ci.yml`（push/PR 到 `main`）。
 
 ## Related Docs
 

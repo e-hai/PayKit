@@ -53,6 +53,10 @@ class DeviceCache(context: Context) {
             txnObj.put("purchaseToken", txn.purchaseToken)
             txnObj.put("isAcknowledged", txn.isAcknowledged)
             txnObj.put("purchaseState", txn.purchaseState.name)
+            txnObj.put("isAutoRenewing", txn.isAutoRenewing)
+            txnObj.put("isSuspended", txn.isSuspended)
+            txnObj.put("signature", txn.signature)
+            txnObj.put("originalJson", txn.originalJson)
             recordsArray.put(txnObj)
         }
         rootObj.put("allPurchaseRecords", recordsArray)
@@ -109,7 +113,11 @@ class DeviceCache(context: Context) {
                                 PurchaseState.valueOf(
                                     txnObj.optString("purchaseState", PurchaseState.PURCHASED.name)
                                 )
-                            }.getOrDefault(PurchaseState.PURCHASED)
+                            }.getOrDefault(PurchaseState.PURCHASED),
+                            isAutoRenewing = txnObj.optBoolean("isAutoRenewing", false),
+                            isSuspended = txnObj.optBoolean("isSuspended", false),
+                            signature = txnObj.optString("signature", ""),
+                            originalJson = txnObj.optString("originalJson", "")
                         )
                     )
                 }

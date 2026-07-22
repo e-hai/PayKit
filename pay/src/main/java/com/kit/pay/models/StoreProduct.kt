@@ -8,21 +8,25 @@ data class StoreProduct(
     val type: ProductType,
     val title: String,
     val description: String,
-    val price: String,             // 格式化后的价格（例如 "$9.99"，多为首个定价阶段）
+    /** 展示用价格：订阅优先为正价（试用后阶段），一次性为商品价 */
+    val price: String,
     val priceAmountMicros: Long,
     val priceCurrencyCode: String,
 
-    /** 订阅必填：对应 Google offerToken */
+    /** Google offerToken：订阅必填；一次性多 offer 时亦需带上以买对方案 */
     val subscriptionToken: String? = null,
 
-    /** 订阅 base plan ID（如 monthly / yearly） */
+    /** 订阅 base plan ID（如 monthly / yearly）；一次性商品一般为 null */
     val basePlanId: String? = null,
 
-    /** 订阅优惠 ID；基础价 offer 可能为 null */
+    /** 优惠 / 购买选项 ID；基础价可能为 null */
     val offerId: String? = null,
 
     /** 首个定价阶段价格为 0 时视为含免费试用 */
     val hasFreeTrial: Boolean = false,
+
+    /** 免费试用阶段的计费周期（ISO 8601，如 P1W）；无试用为 null */
+    val freeTrialPeriod: String? = null,
 
     /** 底层 ProductDetails，购买用；不可序列化依赖 */
     @Transient val nativeProductDetails: Any? = null

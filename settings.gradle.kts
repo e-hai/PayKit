@@ -15,5 +15,5 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "PayKit"
-include(":app")
+include(":sample")
 include(":pay")

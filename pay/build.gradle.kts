@@ -57,4 +57,5 @@ afterEvaluate {
 
 dependencies {
     implementation(libs.bundles.pay)
+    testImplementation(libs.junit)
 }

@@ -13,29 +13,39 @@ class CustomerInfoHelper(
 ) {
 
     /**
-     * 将底层上报的订单进行解析、组装成最终版的 CustomerInfo。
+     * 用**当前商店查询结果**组装 [CustomerInfo]（不做无限历史合并）。
      *
-     * - 所有交易（含 PENDING、未确认）写入 [CustomerInfo.allPurchaseRecords]
-     * - 仅 `PURCHASED` 且已 acknowledge/consume 成功的订单计入活跃权益
+     * - [CustomerInfo.allPurchaseRecords] = 本次查询快照
+     * - 活跃权益仅来自 `PURCHASED` 且已 acknowledge 的订阅 / 非消耗
+     * - [CustomerInfo.unfulfilledConsumables] = 已支付、未 consume、且不在 [fulfilledConsumableTokens] 中的消耗品
      */
     fun computeCustomerInfo(
-        cachedInfo: CustomerInfo?,
-        validTransactions: List<StoreTransaction>
+        storeTransactions: List<StoreTransaction>,
+        fulfilledConsumableTokens: Set<String> = emptySet()
     ): CustomerInfo {
-
         val activeSubscriptions = mutableSetOf<String>()
         val nonConsumablePurchases = mutableSetOf<String>()
+        val unfulfilledConsumables = mutableListOf<StoreTransaction>()
 
-        val mergedRecordsMap = LinkedHashMap<String, StoreTransaction>()
-        cachedInfo?.allPurchaseRecords?.forEach {
-            mergedRecordsMap[it.purchaseToken] = it
-        }
+        for (txn in storeTransactions) {
+            if (txn.purchaseState != PurchaseState.PURCHASED) {
+                continue
+            }
 
-        for (txn in validTransactions) {
-            mergedRecordsMap[txn.purchaseToken] = txn
+            val isConsumable =
+                txn.productIds.any { config.consumableProductIds.contains(it) }
 
-            // 未支付完成，或尚未确认成功：不发权益
-            if (txn.purchaseState != PurchaseState.PURCHASED || !txn.isAcknowledged) {
+            if (isConsumable) {
+                // 消耗品不进 active* 集合；未进履约账本的需宿主发货
+                if (!txn.isAcknowledged &&
+                    txn.purchaseToken !in fulfilledConsumableTokens
+                ) {
+                    unfulfilledConsumables.add(txn)
+                }
+                continue
+            }
+
+            if (!txn.isAcknowledged) {
                 continue
             }
 
@@ -51,7 +61,11 @@ class CustomerInfoHelper(
         return CustomerInfo(
             activeSubscriptions = activeSubscriptions,
             nonConsumablePurchases = nonConsumablePurchases,
-            allPurchaseRecords = mergedRecordsMap.values.toList()
+            allPurchaseRecords = storeTransactions,
+            unfulfilledConsumables = unfulfilledConsumables
         )
     }
+
+    fun isConsumable(transaction: StoreTransaction): Boolean =
+        transaction.productIds.any { config.consumableProductIds.contains(it) }
 }

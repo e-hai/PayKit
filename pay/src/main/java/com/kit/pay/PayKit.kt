@@ -7,6 +7,7 @@ import androidx.lifecycle.lifecycleScope
 import com.kit.pay.billing.BillingAbstract
 import com.kit.pay.billing.GoogleBillingWrapper
 import com.kit.pay.billing.PayKitPurchasesUpdatedListener
+import com.kit.pay.caching.ConsumableLedger
 import com.kit.pay.caching.DeviceCache
 import com.kit.pay.interfaces.*
 import com.kit.pay.models.*
@@ -43,9 +44,16 @@ class PayKit private constructor(
 ) : PayKitPurchasesUpdatedListener {
 
     private val deviceCache = DeviceCache(applicationContext)
+    private val consumableLedger = ConsumableLedger(applicationContext)
     private val customerInfoHelper = CustomerInfoHelper(configuration)
     private val billingWrapper: BillingAbstract = GoogleBillingWrapper(applicationContext)
     private var updateListener: UpdatedCustomerInfoListener? = null
+
+    @Volatile
+    private var purchaseVerifier: PurchaseVerifier = configuration.purchaseVerifier
+
+    /** 保护 [activePurchaseCallback] 的读写，避免并发 purchase 互相覆盖 */
+    private val purchaseLock = Any()
 
     // 用于暂存由 Activity 发起的购买回调
     private var activePurchaseCallback: PurchaseCallback? = null
@@ -81,8 +89,11 @@ class PayKit private constructor(
      * 取出当前购买回调并在主线程执行；保证只投递一次。
      */
     private fun dispatchPurchaseCallback(block: (PurchaseCallback) -> Unit) {
-        val callback = activePurchaseCallback ?: return
-        activePurchaseCallback = null
+        val callback = synchronized(purchaseLock) {
+            val cb = activePurchaseCallback ?: return
+            activePurchaseCallback = null
+            cb
+        }
         MainThreadDispatcher.post { block(callback) }
     }
 
@@ -90,7 +101,8 @@ class PayKit private constructor(
      * 向 Google 同步购买记录：确认未处理的 PURCHASED、更新缓存与监听器。
      *
      * - SUBS / INAPP 并行查询
-     * - acknowledge / consume 失败的订单不计入活跃权益，且本方法返回 failure
+     * - 订阅 / 非消耗：acknowledge；失败不计入权益且返回 failure
+     * - 消耗品：仅当履约账本已标记「已发货待 consume」时才 consume；新单留给宿主发货
      */
     private suspend fun syncPurchasesInternal(): Result<CustomerInfo> = coroutineScope {
         LogUtil.d("syncPurchases start")
@@ -111,7 +123,6 @@ class PayKit private constructor(
                 "count=${allTransactions.size}"
         )
 
-        // 任一侧查询失败都不得用「半份」订单重算权益，否则会清空另一侧的活跃订阅/非消耗
         if (subsResult.isFailure || inappResult.isFailure) {
             val error = subsResult.exceptionOrNull()
                 ?: inappResult.exceptionOrNull()
@@ -135,12 +146,43 @@ class PayKit private constructor(
             it.purchaseState == PurchaseState.PURCHASED
         }
         for (txn in purchasedTransactions) {
+            val isConsumable = customerInfoHelper.isConsumable(txn)
+            if (isConsumable) {
+                if (!consumableLedger.isFulfilledPendingConsume(txn.purchaseToken)) {
+                    // 待宿主发货：不在此处 consume
+                    continue
+                }
+                val consumeResult = billingWrapper.consumeAndAcknowledge(txn, isConsumable = true)
+                if (consumeResult.isSuccess) {
+                    consumableLedger.remove(txn.purchaseToken)
+                    val index = transactionsForCompute.indexOfFirst {
+                        it.purchaseToken == txn.purchaseToken
+                    }
+                    if (index >= 0) {
+                        transactionsForCompute[index] = txn.copy(isAcknowledged = true)
+                    }
+                    LogUtil.d(
+                        "syncPurchases consumeOk orderId=${txn.orderId} " +
+                            "products=${txn.productIds}"
+                    )
+                } else {
+                    val error = consumeResult.exceptionOrNull()
+                        ?: PayKitError(ErrorCode.STORE_PROBLEM, "Consume failed")
+                    LogUtil.e(
+                        "syncPurchases consumeFail orderId=${txn.orderId} " +
+                            "products=${txn.productIds} msg=${error.message}"
+                    )
+                    if (acknowledgeFailure == null) {
+                        acknowledgeFailure = error
+                    }
+                }
+                continue
+            }
+
             if (txn.isAcknowledged) {
                 continue
             }
-            val isConsumable =
-                txn.productIds.any { configuration.consumableProductIds.contains(it) }
-            val ackResult = billingWrapper.consumeAndAcknowledge(txn, isConsumable)
+            val ackResult = billingWrapper.consumeAndAcknowledge(txn, isConsumable = false)
             if (ackResult.isSuccess) {
                 val index = transactionsForCompute.indexOfFirst {
                     it.purchaseToken == txn.purchaseToken
@@ -150,10 +192,10 @@ class PayKit private constructor(
                 }
             } else {
                 val error = ackResult.exceptionOrNull()
-                    ?: PayKitError(ErrorCode.STORE_PROBLEM, "Acknowledge/consume failed")
+                    ?: PayKitError(ErrorCode.STORE_PROBLEM, "Acknowledge failed")
                 LogUtil.e(
                     "syncPurchases ackFail orderId=${txn.orderId} " +
-                        "products=${txn.productIds} consumable=$isConsumable msg=${error.message}"
+                        "products=${txn.productIds} msg=${error.message}"
                 )
                 if (acknowledgeFailure == null) {
                     acknowledgeFailure = error
@@ -161,7 +203,14 @@ class PayKit private constructor(
             }
         }
 
-        val newInfo = customerInfoHelper.computeCustomerInfo(cachedInfo, transactionsForCompute)
+        // 已 consume 成功的消耗品不再出现在 Google 列表；从快照中去掉已确认消耗项更干净
+        val snapshot = transactionsForCompute.filterNot {
+            customerInfoHelper.isConsumable(it) && it.isAcknowledged
+        }
+        val fulfilledTokens = consumableLedger.getAll()
+            .map { it.purchaseToken }
+            .toSet()
+        val newInfo = customerInfoHelper.computeCustomerInfo(snapshot, fulfilledTokens)
         deviceCache.cacheCustomerInfo(newInfo)
         dispatchCustomerInfo(newInfo)
 
@@ -169,6 +218,7 @@ class PayKit private constructor(
             LogUtil.e(
                 "syncPurchases done success=false " +
                     "activeSubs=${newInfo.activeSubscriptions.size} " +
+                    "unfulfilledConsumables=${newInfo.unfulfilledConsumables.size} " +
                     "pending=${newInfo.pendingPurchases.size} " +
                     "msg=${acknowledgeFailure.message}"
             )
@@ -183,7 +233,8 @@ class PayKit private constructor(
                 "syncPurchases done success=true " +
                     "activeSubs=${newInfo.activeSubscriptions.size} " +
                     "nonConsumables=${newInfo.nonConsumablePurchases.size} " +
-                    "pending=${newInfo.pendingPurchases.size} " +
+                    "unfulfilledConsumables=${newInfo.unfulfilledConsumables.size} " +
+                    "ledger=${fulfilledTokens.size} " +
                     "records=${newInfo.allPurchaseRecords.size}"
             )
             Result.success(newInfo)
@@ -196,6 +247,31 @@ class PayKit private constructor(
 
     fun setUpdatedCustomerInfoListener(listener: UpdatedCustomerInfoListener?) {
         this.updateListener = listener
+    }
+
+    /**
+     * 设置 / 替换验单扩展。默认 [LocalPurchaseVerifier]。
+     * 传入自定义实现即可对接服务端，无需改购买主流程。
+     */
+    fun setPurchaseVerifier(verifier: PurchaseVerifier) {
+        this.purchaseVerifier = verifier
+        LogUtil.d("setPurchaseVerifier impl=${verifier::class.java.simpleName}")
+    }
+
+    private suspend fun verifyPurchase(transaction: StoreTransaction): PayKitError? {
+        val result = purchaseVerifier.verify(transaction)
+        if (result.isSuccess) return null
+        val err = result.exceptionOrNull()
+        val payKitError = err as? PayKitError
+            ?: PayKitError(
+                ErrorCode.VERIFICATION_FAILED,
+                err?.message ?: "Purchase verification failed"
+            )
+        LogUtil.e(
+            "verifyPurchase fail orderId=${transaction.orderId} " +
+                "products=${transaction.productIds} code=${payKitError.code} msg=${payKitError.message}"
+        )
+        return payKitError
     }
 
     /**
@@ -240,7 +316,7 @@ class PayKit private constructor(
         getCustomerInfo(forceSync = true)?.pendingPurchases.orEmpty()
 
     /**
-     * 本地合并后的购买历史（会先同步商店当前购买，再与缓存合并）。
+     * 当前商店可见的购买快照（先 sync）。不含已成功 consume 的消耗品。
      */
     suspend fun getPurchaseHistory(): List<StoreTransaction> =
         getCustomerInfo(forceSync = true)?.allPurchaseRecords.orEmpty()
@@ -255,6 +331,59 @@ class PayKit private constructor(
     }
 
     /**
+     * 履约账本中「已发货、待 consume」的消耗品（落盘）。
+     */
+    fun getConsumablesPendingConsume(): List<ConsumableLedgerEntry> =
+        consumableLedger.getAll()
+
+    /**
+     * 宿主发货后调用：先经 [PurchaseVerifier] 验单，再写入履约账本并尝试 consume。
+     *
+     * - 验单失败：不记账本、不 consume
+     * - consume 成功：从账本移除，并刷新 [CustomerInfo]
+     * - consume 失败：保留账本条目，下次 [syncPurchases] 会重试
+     */
+    suspend fun markConsumableFulfilled(purchaseToken: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            val txn = findTransaction(purchaseToken)
+                ?: return@withContext Result.failure(
+                    PayKitError(
+                        ErrorCode.PRODUCT_NOT_AVAILABLE,
+                        "No local transaction for token"
+                    )
+                )
+            if (!customerInfoHelper.isConsumable(txn)) {
+                return@withContext Result.failure(
+                    PayKitError(
+                        ErrorCode.STORE_PROBLEM,
+                        "Not a consumable product: ${txn.productIds}"
+                    )
+                )
+            }
+            verifyPurchase(txn)?.let { return@withContext Result.failure(it) }
+
+            consumableLedger.markFulfilledPendingConsume(txn)
+            LogUtil.d(
+                "markConsumableFulfilled token=${purchaseToken.take(8)}… " +
+                    "products=${txn.productIds}"
+            )
+            val consumeResult = billingWrapper.consumeAndAcknowledge(txn, isConsumable = true)
+            if (consumeResult.isSuccess) {
+                consumableLedger.remove(purchaseToken)
+                syncPurchasesInternal()
+                Result.success(Unit)
+            } else {
+                val error = consumeResult.exceptionOrNull()
+                    ?: PayKitError(ErrorCode.STORE_PROBLEM, "Consume failed")
+                LogUtil.e("markConsumableFulfilled consumeFail msg=${error.message}")
+                Result.failure(
+                    error as? PayKitError
+                        ?: PayKitError(ErrorCode.STORE_PROBLEM, error.message ?: "Consume failed")
+                )
+            }
+        }
+
+    /**
      * 查询指定商品 ID 的详细信息。
      */
     suspend fun getProducts(productIds: Set<String>): Result<List<StoreProduct>> =
@@ -263,6 +392,18 @@ class PayKit private constructor(
             val inappIds = productIds.filter {
                 configuration.consumableProductIds.contains(it) ||
                         configuration.nonConsumableProductIds.contains(it)
+            }
+            val unknownIds = productIds - subsIds.toSet() - inappIds.toSet()
+            if (unknownIds.isNotEmpty()) {
+                LogUtil.w("getProducts unknownIds=$unknownIds notInConfiguration=true")
+            }
+            if (productIds.isNotEmpty() && subsIds.isEmpty() && inappIds.isEmpty()) {
+                return@withContext Result.failure(
+                    PayKitError(
+                        ErrorCode.PRODUCT_NOT_AVAILABLE,
+                        "productIds not declared in PayKitConfiguration: $productIds"
+                    )
+                )
             }
 
             val allProducts = mutableListOf<StoreProduct>()
@@ -308,6 +449,8 @@ class PayKit private constructor(
      * 发起支付。
      *
      * 回调（[PurchaseCallback]）一律在**主线程**投递。
+     * 同一时刻只允许一笔进行中的购买；若已有进行中购买，新请求会立刻
+     * [PurchaseCallback.onError]（[ErrorCode.PURCHASE_IN_PROGRESS]），不会顶掉前一次回调。
      *
      * @param isOfferPersonalized 是否披露个性化价格（欧盟消费者保护要求）。
      * 默认取 [PayKitConfiguration.isOfferPersonalizedDefault]。
@@ -320,7 +463,24 @@ class PayKit private constructor(
         isOfferPersonalized: Boolean = configuration.isOfferPersonalizedDefault,
         subscriptionReplacement: SubscriptionReplacement? = null
     ) {
-        this.activePurchaseCallback = callback
+        synchronized(purchaseLock) {
+            if (activePurchaseCallback != null) {
+                LogUtil.w(
+                    "purchase rejected inProgress=true productId=${storeProduct.productId}"
+                )
+                MainThreadDispatcher.post {
+                    callback.onError(
+                        PayKitError(
+                            ErrorCode.PURCHASE_IN_PROGRESS,
+                            "Another purchase is already in progress"
+                        ),
+                        userCancelled = false
+                    )
+                }
+                return
+            }
+            this.activePurchaseCallback = callback
+        }
         LogUtil.d(
             "purchase start productId=${storeProduct.productId} type=${storeProduct.type} " +
                 "personalized=$isOfferPersonalized " +
@@ -358,7 +518,7 @@ class PayKit private constructor(
     override fun onPurchasesUpdated(successfulPurchases: List<StoreTransaction>) {
         applicationScope.launch {
             val syncResult = syncPurchasesInternal()
-            val latestInfo = syncResult.getOrNull()
+            var latestInfo = syncResult.getOrNull()
             if (activePurchaseCallback == null) return@launch
 
             val purchased = successfulPurchases.filter {
@@ -366,12 +526,65 @@ class PayKit private constructor(
             }
             if (purchased.isNotEmpty()) {
                 if (latestInfo != null) {
+                    val primary = purchased.first()
+                    verifyPurchase(primary)?.let { error ->
+                        dispatchPurchaseCallback { cb ->
+                            cb.onError(error, userCancelled = false)
+                        }
+                        return@launch
+                    }
+
+                    // 验单通过后再记履约账本 → onCompleted（宿主发货）→ consume
+                    val consumables = purchased.filter { customerInfoHelper.isConsumable(it) }
+                    for (txn in consumables) {
+                        if (!consumableLedger.isFulfilledPendingConsume(txn.purchaseToken)) {
+                            consumableLedger.markFulfilledPendingConsume(txn)
+                        }
+                    }
+                    if (consumables.isNotEmpty()) {
+                        val fulfilled = consumableLedger.getAll().map { it.purchaseToken }.toSet()
+                        latestInfo = customerInfoHelper.computeCustomerInfo(
+                            latestInfo.allPurchaseRecords,
+                            fulfilled
+                        )
+                        deviceCache.cacheCustomerInfo(latestInfo)
+                    }
+
                     LogUtil.d(
-                        "purchase completed orderId=${purchased.first().orderId} " +
-                            "products=${purchased.first().productIds}"
+                        "purchase completed orderId=${primary.orderId} " +
+                            "products=${primary.productIds}"
                     )
-                    dispatchPurchaseCallback { cb ->
-                        cb.onCompleted(purchased.first(), latestInfo)
+                    val infoForCallback = latestInfo
+                    val callback = synchronized(purchaseLock) {
+                        val cb = activePurchaseCallback
+                        activePurchaseCallback = null
+                        cb
+                    }
+                    if (callback != null) {
+                        MainThreadDispatcher.run {
+                            callback.onCompleted(primary, infoForCallback)
+                        }
+                    }
+
+                    // 发货回调返回后再 consume；失败留在账本供下次 sync 重试
+                    for (txn in consumables) {
+                        val consumeResult =
+                            billingWrapper.consumeAndAcknowledge(txn, isConsumable = true)
+                        if (consumeResult.isSuccess) {
+                            consumableLedger.remove(txn.purchaseToken)
+                            LogUtil.d(
+                                "purchase consumeOk orderId=${txn.orderId} " +
+                                    "products=${txn.productIds}"
+                            )
+                        } else {
+                            LogUtil.e(
+                                "purchase consumeFail orderId=${txn.orderId} " +
+                                    "msg=${consumeResult.exceptionOrNull()?.message}"
+                            )
+                        }
+                    }
+                    if (consumables.isNotEmpty()) {
+                        syncPurchasesInternal()
                     }
                 } else {
                     val error = syncResult.exceptionOrNull() as? PayKitError
@@ -431,6 +644,9 @@ class PayKit private constructor(
         val shared: PayKit
             get() = sharedInstance ?: throw IllegalStateException("PayKit is not configured.")
 
+        /**
+         * 初始化 SDK（进程内只生效一次，除非先 [reset]）。
+         */
         fun configure(
             context: Context,
             configuration: PayKitConfiguration
@@ -443,8 +659,35 @@ class PayKit private constructor(
                         val instance = PayKit(applicationContext, applicationScope, configuration)
                         sharedInstance = instance
                         instance.initialize()
+                    } else {
+                        LogUtil.w("configure ignored alreadyConfigured=true use reset() first")
                     }
                 }
+            } else {
+                LogUtil.w("configure ignored alreadyConfigured=true use reset() first")
+            }
+        }
+
+        /**
+         * 断开 Billing、清空单例与本地权益缓存，便于测试或更换 [PayKitConfiguration]。
+         * 之后需再次 [configure]。
+         *
+         * @param clearCache 是否清除权益缓存与消耗品履约账本（默认 true）
+         */
+        fun reset(clearCache: Boolean = true) {
+            synchronized(this) {
+                val instance = sharedInstance ?: return
+                synchronized(instance.purchaseLock) {
+                    instance.activePurchaseCallback = null
+                }
+                instance.updateListener = null
+                runCatching { instance.billingWrapper.endConnection() }
+                if (clearCache) {
+                    runCatching { instance.deviceCache.clearCache() }
+                    runCatching { instance.consumableLedger.clear() }
+                }
+                sharedInstance = null
+                LogUtil.d("reset done clearCache=$clearCache")
             }
         }
     }

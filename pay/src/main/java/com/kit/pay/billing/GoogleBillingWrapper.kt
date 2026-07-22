@@ -9,11 +9,13 @@ import com.kit.pay.models.ProductType
 import com.kit.pay.models.PurchaseState
 import com.kit.pay.models.StoreProduct
 import com.kit.pay.models.StoreTransaction
+import com.kit.pay.models.SubscriptionOfferPricing
 import com.kit.pay.models.SubscriptionReplacement
 import com.kit.pay.models.SubscriptionReplacementMode
 import com.kit.pay.utils.LogUtil
 import kotlinx.coroutines.delay
 import java.lang.ref.WeakReference
+import kotlin.time.Duration.Companion.milliseconds
 
 /**
  * Google Play Billing 服务封装实现。
@@ -96,7 +98,8 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
                 logD("ensureConnected success")
                 return true
             }
-            delay(checkInterval.toLong())
+
+            delay(checkInterval.toLong().milliseconds)
             waitTime += checkInterval
         }
 
@@ -388,11 +391,21 @@ class GoogleBillingWrapper(applicationContext: Context) : BillingAbstract(),
             }
             listOf(productParams.build())
         } else {
-            listOf(
-                BillingFlowParams.ProductDetailsParams.newBuilder()
-                    .setProductDetails(pDetail)
-                    .build()
-            )
+            val productParams = BillingFlowParams.ProductDetailsParams.newBuilder()
+                .setProductDetails(pDetail)
+            val offerToken = storeProduct.subscriptionToken
+            if (!offerToken.isNullOrBlank()) {
+                productParams.setOfferToken(offerToken)
+            } else if (!storeProduct.offerId.isNullOrBlank()) {
+                // 多 offer 场景下缺少 token 无法保证买对方案
+                return Result.failure(
+                    PayKitError(
+                        ErrorCode.PRODUCT_NOT_AVAILABLE,
+                        "Missing offer token for in-app offerId=${storeProduct.offerId}"
+                    )
+                )
+            }
+            listOf(productParams.build())
         }
 
         val flowBuilder = BillingFlowParams.newBuilder()
@@ -553,11 +566,20 @@ private fun BillingResult.toPayKitError(): PayKitError {
     val code = when (this.responseCode) {
         BillingClient.BillingResponseCode.USER_CANCELED -> ErrorCode.PURCHASE_CANCELLED
 
-        BillingClient.BillingResponseCode.BILLING_UNAVAILABLE,
         BillingClient.BillingResponseCode.ITEM_UNAVAILABLE -> ErrorCode.PRODUCT_NOT_AVAILABLE
 
+        BillingClient.BillingResponseCode.BILLING_UNAVAILABLE,
+        BillingClient.BillingResponseCode.FEATURE_NOT_SUPPORTED -> ErrorCode.PURCHASE_NOT_ALLOWED
+
+        BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED -> ErrorCode.ITEM_ALREADY_OWNED
+
         BillingClient.BillingResponseCode.NETWORK_ERROR,
-        BillingClient.BillingResponseCode.SERVICE_UNAVAILABLE -> ErrorCode.NETWORK_ERROR
+        BillingClient.BillingResponseCode.SERVICE_UNAVAILABLE,
+        BillingClient.BillingResponseCode.SERVICE_DISCONNECTED -> ErrorCode.NETWORK_ERROR
+
+        BillingClient.BillingResponseCode.ERROR,
+        BillingClient.BillingResponseCode.DEVELOPER_ERROR,
+        BillingClient.BillingResponseCode.ITEM_NOT_OWNED -> ErrorCode.STORE_PROBLEM
 
         else -> ErrorCode.STORE_PROBLEM
     }
@@ -571,8 +593,11 @@ private fun BillingResult.toPayKitError(): PayKitError {
 private fun ProductDetails.toStoreProducts(type: ProductType): List<StoreProduct> {
     val list = mutableListOf<StoreProduct>()
     if (type == ProductType.INAPP) {
-        val details = this.oneTimePurchaseOfferDetails
-        if (details != null) {
+        // 优先多 offer 列表；否则回退旧版单一 offer
+        val offers = oneTimePurchaseOfferDetailsList
+            ?.takeIf { it.isNotEmpty() }
+            ?: listOfNotNull(oneTimePurchaseOfferDetails)
+        offers.forEach { details ->
             list.add(
                 StoreProduct(
                     productId = this.productId,
@@ -582,27 +607,38 @@ private fun ProductDetails.toStoreProducts(type: ProductType): List<StoreProduct
                     price = details.formattedPrice,
                     priceAmountMicros = details.priceAmountMicros,
                     priceCurrencyCode = details.priceCurrencyCode,
+                    subscriptionToken = details.offerToken,
+                    offerId = details.offerId ?: details.purchaseOptionId,
                     nativeProductDetails = this
                 )
             )
         }
     } else {
         this.subscriptionOfferDetails?.forEach { subOffer ->
-            val phase = subOffer.pricingPhases.pricingPhaseList.firstOrNull()
-            val hasFreeTrial = phase != null && phase.priceAmountMicros == 0L
+            val pricing = SubscriptionOfferPricing.fromPhases(
+                subOffer.pricingPhases.pricingPhaseList.map { phase ->
+                    SubscriptionOfferPricing.Phase(
+                        priceAmountMicros = phase.priceAmountMicros,
+                        formattedPrice = phase.formattedPrice,
+                        priceCurrencyCode = phase.priceCurrencyCode,
+                        billingPeriod = phase.billingPeriod
+                    )
+                }
+            )
             list.add(
                 StoreProduct(
                     productId = this.productId,
                     type = type,
                     title = this.title,
                     description = this.description,
-                    price = phase?.formattedPrice ?: "",
-                    priceAmountMicros = phase?.priceAmountMicros ?: 0,
-                    priceCurrencyCode = phase?.priceCurrencyCode ?: "",
+                    price = pricing.price,
+                    priceAmountMicros = pricing.priceAmountMicros,
+                    priceCurrencyCode = pricing.priceCurrencyCode,
                     subscriptionToken = subOffer.offerToken,
                     basePlanId = subOffer.basePlanId,
                     offerId = subOffer.offerId,
-                    hasFreeTrial = hasFreeTrial,
+                    hasFreeTrial = pricing.hasFreeTrial,
+                    freeTrialPeriod = pricing.freeTrialPeriod,
                     nativeProductDetails = this
                 )
             )
@@ -622,7 +658,11 @@ private fun Purchase.toStoreTransaction(): StoreTransaction {
             Purchase.PurchaseState.PURCHASED -> PurchaseState.PURCHASED
             Purchase.PurchaseState.PENDING -> PurchaseState.PENDING
             else -> PurchaseState.UNSPECIFIED
-        }
+        },
+        isAutoRenewing = this.isAutoRenewing,
+        isSuspended = this.isSuspended,
+        signature = this.signature.orEmpty(),
+        originalJson = this.originalJson.orEmpty()
     )
 }
 

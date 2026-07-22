@@ -10,7 +10,105 @@ PayKit 是一个轻量级的 Android 支付结算库，封装了 Google Play Bil
 - ✅ 自动处理订单确认和权益同步
 - ✅ 支持订阅商品、消耗型商品、非消耗型商品
 - ✅ 内置订单恢复机制，防止掉单
-- ✅ 线程安全，支持多模块并发调用
+- ✅ 线程安全；查询 / 同步可并发，购买同一时刻仅允许一笔进行中
+
+---
+
+## 🏗 架构与流程
+
+### 代码架构
+
+宿主只依赖 `PayKit` 门面；Billing、缓存、权益计算与可选验单扩展在库内分层协作。
+
+```mermaid
+flowchart TB
+    subgraph Host["宿主 App"]
+        VM["ViewModel / Activity"]
+    end
+
+    subgraph SDK[":pay SDK"]
+        PK["PayKit 单例门面"]
+        PV["PurchaseVerifier<br/>默认 Local / 可接服务端"]
+        CIH["CustomerInfoHelper<br/>订单 → 权益"]
+        DC["DeviceCache<br/>权益快照"]
+        CL["ConsumableLedger<br/>消耗品履约账本"]
+        BA["BillingAbstract"]
+        GB["GoogleBillingWrapper"]
+        BC["BillingClient 8.x"]
+    end
+
+    VM --> PK
+    PK --> PV
+    PK --> CIH
+    PK --> DC
+    PK --> CL
+    PK --> BA
+    BA --> GB
+    GB --> BC
+```
+
+| 组件 | 职责 |
+|------|------|
+| `PayKit` | 对外 API：配置、查询、购买、同步、恢复 |
+| `GoogleBillingWrapper` | 连接商店、查询商品/订单、launchBillingFlow、ack/consume |
+| `CustomerInfoHelper` | 按配置三分法归类订阅 / 消耗 / 非消耗 |
+| `DeviceCache` | `CustomerInfo` 本地快照（秒开） |
+| `ConsumableLedger` | 消耗品「已发货待 consume」落盘，防掉单与重复发货 |
+| `PurchaseVerifier` | 发货前验单钩子；默认不联网 |
+
+### 初始化与同步
+
+```mermaid
+sequenceDiagram
+    participant App as 宿主
+    participant PK as PayKit
+    participant GB as Billing
+    participant Cache as DeviceCache
+
+    App->>PK: configure(context, config)
+    PK->>GB: startConnection
+    GB-->>PK: onConnected
+    PK->>GB: queryPurchases SUBS ∥ INAPP
+    GB-->>PK: StoreTransaction 列表
+    Note over PK: PURCHASED：订阅/非消耗 acknowledge<br/>账本已履约的消耗品 consume
+    PK->>Cache: 写入 CustomerInfo
+    PK-->>App: UpdatedCustomerInfoListener（主线程）
+```
+
+### 购买流程
+
+```mermaid
+flowchart TD
+    A["purchase(activity, product, callback)"] --> B{已有进行中购买?}
+    B -->|是| C["onError PURCHASE_IN_PROGRESS"]
+    B -->|否| D["launchBillingFlow"]
+    D --> E["onPurchasesUpdated"]
+    E --> F{purchaseState}
+    F -->|PENDING| G["onPending 勿发货"]
+    F -->|PURCHASED| H["syncPurchases"]
+    H --> I["PurchaseVerifier.verify"]
+    I -->|失败| J["onError VERIFICATION_FAILED"]
+    I -->|成功| K{消耗品?}
+    K -->|是| L["写入 ConsumableLedger"]
+    K -->|否| M["acknowledge 已在 sync 中处理"]
+    L --> N["onCompleted 宿主发货"]
+    M --> N
+    N --> O{消耗品?}
+    O -->|是| P["consume；失败留账本下次 sync 重试"]
+    O -->|否| Q["结束"]
+    P --> Q
+```
+
+### 商品类型与确认方式
+
+配置必须声明类型，补单才能选对 API（**勿**仅凭 `INAPP` 判断是否消耗）：
+
+```mermaid
+flowchart LR
+    CFG["PayKitConfiguration"] --> S["subsProductIds → SUBS<br/>acknowledgePurchase"]
+    CFG --> C["consumableProductIds → INAPP<br/>consumePurchase"]
+    CFG --> N["nonConsumableProductIds → INAPP<br/>acknowledgePurchase"]
+```
 
 ---
 
@@ -55,17 +153,15 @@ dependencies {
 在 Google Play Console 创建商品后，记录商品 ID：
 
 ```kotlin
-// Constants.kt
+// Constants.kt — Demo 与 Play Console 对齐的示例
 object Constants {
-    // 一个订阅 product 对应一个权益档；月/年在 Play Console 配为 base plan
+    // 一个订阅 product 对应一个权益档；周期为 base plan
     const val SUBS_PLUS = "subs_plus"
     const val SUBS_PRO = "subs_pro"
-    
-    // 消耗型商品（可重复购买）
-    const val CONSUMABLE_COINS_100 = "coins_100"
-    
-    // 非消耗型商品（永久拥有）
-    const val NON_CONSUMABLE_PREMIUM = "premium_unlock"
+
+    // 消耗 / 非消耗（与 Demo applicationId 下 Console 商品一致）
+    const val OTP_GAME_SKIN_3DAY = "consumable_product_01"
+    const val OTP_GAME_SKIN_PERMANENT = "one_time_product_01"
 }
 ```
 
@@ -84,10 +180,10 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                 Constants.SUBS_PRO
             ),
             consumableProductIds = setOf(
-                Constants.CONSUMABLE_COINS_100
+                Constants.OTP_GAME_SKIN_3DAY
             ),
             nonConsumableProductIds = setOf(
-                Constants.NON_CONSUMABLE_PREMIUM
+                Constants.OTP_GAME_SKIN_PERMANENT
             )
         )
 
@@ -126,7 +222,7 @@ viewModelScope.launch {
         val productIds = setOf(
             Constants.SUBS_PLUS,
             Constants.SUBS_PRO,
-            Constants.CONSUMABLE_COINS_100
+            Constants.OTP_GAME_SKIN_3DAY
         )
         
         val result = PayKit.shared.getProducts(productIds)
@@ -279,15 +375,42 @@ suspend fun restorePurchases(): Result<CustomerInfo>
 suspend fun getPendingPurchases(): List<StoreTransaction>
 suspend fun getPurchaseHistory(): List<StoreTransaction>
 fun findTransaction(purchaseToken: String): StoreTransaction?
+fun findActiveSubscription(productId: String): StoreTransaction?
 
-fun purchase(activity: Activity, storeProduct: StoreProduct, callback: PurchaseCallback)
 fun purchase(
     activity: Activity,
     storeProduct: StoreProduct,
     callback: PurchaseCallback,
-    isOfferPersonalized: Boolean  // 欧盟个性化报价披露，默认取 Configuration
+    isOfferPersonalized: Boolean = ...,
+    subscriptionReplacement: SubscriptionReplacement? = null
 )
 fun setUpdatedCustomerInfoListener(listener: UpdatedCustomerInfoListener?)
+fun setPurchaseVerifier(verifier: PurchaseVerifier)  // 默认 Local；可换服务端验单
+```
+
+### 服务端验单扩展（可选）
+
+```kotlin
+PayKit.shared.setPurchaseVerifier(PurchaseVerifier { txn ->
+    runCatching { api.verify(txn.purchaseToken, txn.productIds) }
+        .fold(
+            onSuccess = { Result.success(Unit) },
+            onFailure = {
+                Result.failure(
+                    PayKitError(ErrorCode.VERIFICATION_FAILED, it.message ?: "verify fail")
+                )
+            }
+        )
+})
+```
+
+默认不配置则行为与原先「纯本地」一致。
+
+```kotlin
+// 更换配置或测试前：
+PayKit.reset()                 // 默认同时清空本地权益缓存
+PayKit.reset(clearCache = false)
+PayKit.configure(context, newConfiguration)
 ```
 
 ### 数据模型
@@ -295,53 +418,72 @@ fun setUpdatedCustomerInfoListener(listener: UpdatedCustomerInfoListener?)
 #### CustomerInfo - 用户权益信息
 ```kotlin
 data class CustomerInfo(
-    val activeSubscriptions: Set<String>,           // 活跃的订阅商品 ID
-    val nonConsumablePurchases: Set<String>,        // 已拥有的非消耗商品 ID
-    val allPurchaseRecords: List<StoreTransaction>  // 购买记录（含 PENDING）
-) {
-    val pendingPurchases: List<StoreTransaction>    // 待确认
-    val purchasedRecords: List<StoreTransaction>    // 已支付
+    val activeSubscriptions: Set<String>,
+    val nonConsumablePurchases: Set<String>,
+    val allPurchaseRecords: List<StoreTransaction>,   // 当前商店快照
+    val unfulfilledConsumables: List<StoreTransaction> // 待发货消耗品
+)
+```
+
+消耗品：购买流程中 `onCompleted` 内发货即可（SDK 随后 consume；失败会留履约账本重试）。  
+启动发现的未履约消耗品：
+
+```kotlin
+info.unfulfilledConsumables.forEach { txn ->
+    // 发货…
+    PayKit.shared.markConsumableFulfilled(txn.purchaseToken)
 }
 ```
 
 #### StoreProduct - 商品详情
 ```kotlin
 data class StoreProduct(
-    val productId: String,          // 商品 ID
-    val type: ProductType,          // 商品类型
-    val title: String,              // 标题
-    val description: String,        // 描述
-    val price: String,              // 格式化价格（如 "$9.99"）
-    val priceAmountMicros: Long,    // 价格（微单位）
-    val priceCurrencyCode: String,  // 货币代码（如 "USD"）
-    val subscriptionToken: String?  // 订阅令牌（仅订阅商品）
+    val productId: String,
+    val type: ProductType,
+    val title: String,
+    val description: String,
+    val price: String,                 // 展示价：订阅优先为正价（试用后）
+    val priceAmountMicros: Long,
+    val priceCurrencyCode: String,
+    val subscriptionToken: String?,    // Google offerToken（订阅必填；INAPP 多 offer 亦需）
+    val basePlanId: String? = null,
+    val offerId: String? = null,
+    val hasFreeTrial: Boolean = false,
+    val freeTrialPeriod: String? = null  // 如 P1W
 )
 ```
 
 #### StoreTransaction - 交易记录
 ```kotlin
 data class StoreTransaction(
-    val orderId: String,            // 订单 ID
-    val productIds: List<String>,   // 商品 ID 列表
-    val purchaseTime: Long,         // 购买时间戳
-    val purchaseToken: String,      // 购买令牌
-    val isAcknowledged: Boolean,    // 是否已确认
-    val purchaseState: PurchaseState // PURCHASED / PENDING / UNSPECIFIED
+    val orderId: String,
+    val productIds: List<String>,
+    val purchaseTime: Long,
+    val purchaseToken: String,
+    val isAcknowledged: Boolean,
+    val purchaseState: PurchaseState,  // PURCHASED / PENDING / UNSPECIFIED
+    val isAutoRenewing: Boolean = false,
+    val isSuspended: Boolean = false,
+    val signature: String = "",        // Play 签名，供服务端验签
+    val originalJson: String = ""      // 原始购买 JSON
 )
 ```
 
 #### ErrorCode - 错误码
 ```kotlin
 enum class ErrorCode {
-    OK,                      // 成功
-    PURCHASE_CANCELLED,      // 用户取消
-    PURCHASE_PENDING,        // 支付待确认（勿发货）
-    PRODUCT_NOT_AVAILABLE,   // 商品不可用
-    NETWORK_ERROR,           // 网络错误
-    STORE_PROBLEM            // 商店问题
+    STORE_PROBLEM,
+    PURCHASE_CANCELLED,
+    PURCHASE_PENDING,        // 语义码；待确认走 onPending
+    PURCHASE_IN_PROGRESS,    // 已有购买进行中，二次 purchase 被拒绝
+    PURCHASE_NOT_ALLOWED,    // Billing 不可用 / 特性不支持
+    PRODUCT_NOT_AVAILABLE,
+    ITEM_ALREADY_OWNED,      // 已拥有，应走升降级或恢复
+    VERIFICATION_FAILED,     // PurchaseVerifier 验单失败
+    NETWORK_ERROR,
+    UNKNOWN
 }
 ```
-
 ### 枚举类型
 
 #### ProductType - 商品类型
@@ -372,8 +514,8 @@ enum class PurchaseState {
 - **示例**：会员订阅、高级功能解锁
 
 ### 消耗型商品 (INAPP - Consumable)
-- **特点**：消费后可再次购买
-- **处理**：SDK 自动调用 `consumePurchase` 消耗
+- **特点**：消费后可再次购买；Google 在 consume 成功后不再返回该单
+- **处理**：发货 → 履约账本 → `consumePurchase`；失败可重试，避免重复发货
 - **示例**：游戏金币、临时道具
 
 ### 非消耗型商品 (INAPP - Non-consumable)
@@ -404,6 +546,7 @@ enum class PurchaseState {
    - 所有 suspend 函数应在协程中调用
    - 推荐使用 `viewModelScope.launch`
    - `PurchaseCallback` / `UpdatedCustomerInfoListener` **已在主线程回调**，可直接更新 UI
+   - **购买**：同一时刻只允许一笔进行中；再次 `purchase` 会立刻 `onError(PURCHASE_IN_PROGRESS)`，不会顶掉前一次回调
 
 5. **欧盟个性化报价**：
    - 若价格经自动化决策对用户个性化，购买时需声明，Play 会在支付页展示披露文案
@@ -429,7 +572,7 @@ enum class PurchaseState {
 **A:** 定期调用 `getCustomerInfo()` 检查订阅状态，SDK 会自动更新 `activeSubscriptions`。
 
 ### Q4: 支付成功后如何发放权益？
-**A:** 在 `PurchaseCallback.onCompleted` 中立即发放权益，SDK 已确保订单为 `PURCHASED` 并已确认。
+**A:** 在 `PurchaseCallback.onCompleted` 中发放权益。订阅/非消耗由 SDK acknowledge；消耗品请在回调内发货，SDK 会随后 consume（失败留账本重试）。启动时检查 `unfulfilledConsumables` 并 `markConsumableFulfilled`。
 
 ### Q5: 收到 `onPending` 怎么办？
 **A:** 表示支付尚未完成（如现金/银行转账）。不要发货；提示用户等待确认。支付完成后调用 `restorePurchases()` / `syncPurchases()` 或下次启动自动同步即可补单发货。
